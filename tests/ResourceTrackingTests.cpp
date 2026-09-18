@@ -177,7 +177,8 @@ bool ReadLinearTestMemory(void *userdata, uint64_t address, uint32_t *value) {
 
 std::unique_ptr<Fixture>
 MakeIndirectImageFixture(bool malformed, uint32_t material_immediate = 0,
-                         bool memory_backed_material = false) {
+                         bool memory_backed_material = false,
+                         bool fold_address_offset = true) {
   auto fixture = std::make_unique<Fixture>();
   std::array<Value, 4> material_words;
   std::array<Value, 4> heap_words;
@@ -217,9 +218,13 @@ MakeIndirectImageFixture(bool malformed, uint32_t material_immediate = 0,
                                       {fixture->UserData(8), Value(true)});
   const auto record =
       fixture->Emit(ValueOpcode::IMul32, {selector, Value(224u)});
-  const auto member = fixture->Emit(ValueOpcode::IAdd32, {record, Value(4u)});
+  const auto member = fold_address_offset
+                           ? fixture->Emit(ValueOpcode::IAdd32, {record, Value(4u)})
+                           : record;
   fixture->Emit(ValueOpcode::ReferenceU32, {record});
-  fixture->Emit(ValueOpcode::ReferenceU32, {member});
+  if (fold_address_offset) {
+    fixture->Emit(ValueOpcode::ReferenceU32, {member});
+  }
   MemoryInfo material_scalar;
   material_scalar.kind = ResourceKind::ScalarBuffer;
   material_scalar.offset = material_immediate;
@@ -448,13 +453,45 @@ void TestInvariantIndirectImageMaterialization() {
             malformed->program.descriptor_sources.empty(),
         "malformed indirect image pattern was partially accepted");
 
-  auto wrapped_immediate = MakeIndirectImageFixture(false, 4u);
+  // Demon's Souls keeps its bindless heap index at a fixed non-zero offset within the
+  // material record, encoded purely as the S_BUFFER_LOAD immediate (no address-level add).
+  // That byte address is identical to the folded-address fixture above (record * 224 + 4), so
+  // the same memory layout and user data must materialize the same image descriptor.
+  auto wrapped_immediate = MakeIndirectImageFixture(false, 4u, false, false);
   BuildSrtPlan(wrapped_immediate->program);
-  CheckFatal([&] { TrackResources(wrapped_immediate->program); },
-             "not a valid runtime value",
-             "wrapped scalar immediate entered the invariant image proof");
-  Check(!wrapped_immediate->program.resource_tracking_complete,
-        "wrapped scalar immediate entered the invariant image proof");
+  TrackResources(wrapped_immediate->program);
+  Check(wrapped_immediate->program.resource_tracking_complete,
+        "material key at a fixed non-zero SMEM offset was rejected");
+  const auto wrapped_source = wrapped_immediate->program.info.images[0].source;
+  Check(wrapped_source < wrapped_immediate->program.descriptor_sources.size(),
+        "material key at a fixed non-zero SMEM offset lost its descriptor source");
+  const auto &wrapped_indirect =
+      wrapped_immediate->program.descriptor_sources[wrapped_source].indirect_image;
+  Check(wrapped_indirect.has_value() && wrapped_indirect->selector_offset == 0u &&
+            wrapped_indirect->material_offset == 4u,
+        "fixed SMEM immediate offset was not captured on the indirect image plan");
+
+  auto wrapped_resource_plan = ExtractResourcePlan(wrapped_immediate->program);
+  EliminateDeadCode(wrapped_immediate->program.blocks);
+  // A dedicated, untouched memory image: the shared `memory`/`user_data` above have been
+  // mutated by every prior sub-test, so reusing them here would pick up stale material-buffer
+  // content at the other probed record slots instead of exercising this fixture in isolation.
+  LinearTestMemory wrapped_memory;
+  for (uint32_t dword = 0; dword < image_descriptor.size(); dword++) {
+    wrapped_memory.words[(0x2000u - wrapped_memory.base) / 4u + dword] = image_descriptor[dword];
+  }
+  SrtRuntime wrapped_runtime{.user_data = user_data,
+                             .userdata = &wrapped_memory,
+                             .read_specialization_memory = ReadLinearTestMemory};
+  ResourceSnapshot wrapped_snapshot;
+  ResourceSpecialization wrapped_specialization;
+  Check(MaterializeResources(wrapped_resource_plan, wrapped_runtime, wrapped_snapshot,
+                             wrapped_specialization) &&
+            wrapped_snapshot.images.size() == 1 &&
+            std::equal(image_descriptor.begin(), image_descriptor.end(),
+                       wrapped_snapshot.images[0].dwords.begin()),
+        "fixed SMEM immediate offset did not materialize the same descriptor as the "
+        "address-folded offset");
 }
 
 void TestComputeBufferFill() {

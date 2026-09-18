@@ -3427,8 +3427,28 @@ public:
                 depth.views.size() == 3,
             "unified depth view cache lost sampled/attachment identity");
 
+    // Depth/stencil format support is hardware-dependent: AMD generally lacks
+    // D24_UNORM_S8_UINT and only exposes D32_SFLOAT_S8_UINT, while other vendors are
+    // often the reverse. Probe like the real depth-target path (depthRenderTarget.cpp)
+    // does instead of assuming one specific combined format is always available.
+    const auto select_depth_stencil_format = [&]() {
+      constexpr std::array<vk::Format, 3> candidates{
+          vk::Format::eD24UnormS8Uint, vk::Format::eD32SfloatS8Uint,
+          vk::Format::eD16UnormS8Uint};
+      for (const auto candidate : candidates) {
+        vk::ImageFormatProperties properties{};
+        if (m_runtime_context.GetImageFormatProperties(
+                candidate, vk::ImageType::e2D, vk::ImageTiling::eOptimal,
+                DepthTargetImageUsage(), vk::ImageCreateFlags{},
+                &properties) == vk::Result::eSuccess) {
+          return candidate;
+        }
+      }
+      EXIT("no host format supports a combined depth/stencil attachment\n");
+    };
+
     auto depth_stencil_info = depth_info;
-    depth_stencil_info.pixel_format = vk::Format::eD24UnormS8Uint;
+    depth_stencil_info.pixel_format = select_depth_stencil_format();
     depth_stencil_info.guest_format = Prospero::BufferFormat::k16UNorm;
     depth_stencil_info.bytes_per_block = 2;
     Libs::Graphics::Image depth_stencil(m_runtime_context, scheduler,

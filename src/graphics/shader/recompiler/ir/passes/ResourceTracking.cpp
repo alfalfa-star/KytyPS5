@@ -131,8 +131,8 @@ public:
 			const auto* inst = value.Resolve().TryInstruction();
 			return std::any_of(m_indirect_images.begin(), m_indirect_images.end(),
 			                   [&](const IndirectImagePlan& plan) {
-				return std::ranges::find(plan.reads, inst) != plan.reads.end();
-			});
+				                   return std::ranges::find(plan.reads, inst) != plan.reads.end();
+			                   });
 		});
 		m_program.descriptor_sources         = std::move(m_sources);
 		m_program.info                       = std::move(m_info);
@@ -201,11 +201,10 @@ private:
 		for (uint32_t arm = 0; arm < 2; arm++) {
 			const auto* incoming = phi->PhiBlock(arm);
 			if (incoming == merge ||
-			    (incoming != branch &&
-			     (incoming->ImmPredecessors().size() != 1u ||
-			      incoming->ImmPredecessors()[0] != branch ||
-			      incoming->ImmSuccessors().size() != 1u ||
-			      incoming->ImmSuccessors()[0] != merge))) {
+			    (incoming != branch && (incoming->ImmPredecessors().size() != 1u ||
+			                            incoming->ImmPredecessors()[0] != branch ||
+			                            incoming->ImmSuccessors().size() != 1u ||
+			                            incoming->ImmSuccessors()[0] != merge))) {
 				return value;
 			}
 			const auto* target = incoming == branch ? merge : incoming;
@@ -435,11 +434,15 @@ private:
 		}
 		uint32_t    material_memory_index = 0;
 		const auto* material_memory       = ScalarReadMemory(*material_read, material_memory_index);
-		if (material_memory == nullptr || material_memory->offset != 0u ||
+		if (material_memory == nullptr ||
 		    !MemoryIndexBelongsTo(material_memory_index, *material_read)) {
 			return false;
 		}
-		auto* material_handle = material_read->Arg(0).Resolve().TryInstruction();
+		// The bindless key does not have to be the first dword of the material record; some
+		// games (e.g. Demon's Souls) keep several texture-heap indices at different fixed
+		// offsets within the same record.
+		const uint32_t material_offset = material_memory->offset;
+		auto*          material_handle = material_read->Arg(0).Resolve().TryInstruction();
 		if (material_handle == nullptr) {
 			return false;
 		}
@@ -482,7 +485,8 @@ private:
 		std::copy(heap_source.dwords.begin(), heap_source.dwords.begin() + 4u,
 		          image_source.dwords.begin() + 4u);
 		image_source.indirect_image = DescriptorSource::IndirectImage {
-		    material_source_index, heap_source_index, selector_stride, selector_offset, 0u};
+		    material_source_index, heap_source_index, selector_stride, selector_offset, 0u,
+		    material_offset};
 
 		plan.handle = &handle;
 		plan.source = InternSource(image_source);
@@ -494,17 +498,15 @@ private:
 	const IndirectImagePlan* FindIndirectImage(const Inst& handle) const {
 		const auto found =
 		    std::find_if(m_indirect_images.begin(), m_indirect_images.end(),
-		                 [&](const IndirectImagePlan& plan) {
-			    return plan.handle == &handle;
-		    });
+		                 [&](const IndirectImagePlan& plan) { return plan.handle == &handle; });
 		return found == m_indirect_images.end() ? nullptr : &*found;
 	}
 
 	bool IsIndirectPlanningMemory(uint32_t index) const {
 		return std::any_of(m_indirect_images.begin(), m_indirect_images.end(),
 		                   [&](const IndirectImagePlan& plan) {
-			return std::ranges::find(plan.memory, index) != plan.memory.end();
-		});
+			                   return std::ranges::find(plan.memory, index) != plan.memory.end();
+		                   });
 	}
 
 	void PlanIndirectImages() {
