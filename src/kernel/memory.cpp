@@ -68,9 +68,9 @@ constexpr int      PAGE_TABLE_POOL_ENTRIES =
     static_cast<int>(PAGE_TABLE_POOL_SIZE / PAGE_TABLE_GRANULARITY);
 constexpr uint64_t DEFAULT_FLEXIBLE_MEMORY_SIZE = 1ull * 1024ull * 1024ull * 1024ull;
 
-static uint64_t                      g_flexible_memory_size        = DEFAULT_FLEXIBLE_MEMORY_SIZE;
-static bool                          g_flexible_memory_size_frozen = false;
-static Graphics::RenderContext*       g_gpu_resources               = nullptr;
+static uint64_t                 g_flexible_memory_size        = DEFAULT_FLEXIBLE_MEMORY_SIZE;
+static bool                     g_flexible_memory_size_frozen = false;
+static Graphics::RenderContext* g_gpu_resources               = nullptr;
 
 static Graphics::RenderContext& GetGpuResources() {
 	EXIT_IF(g_gpu_resources == nullptr);
@@ -871,9 +871,15 @@ bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size) {
 bool TryReadGpuCleanBacking(uint64_t vaddr, void* data, uint64_t size) {
 	if (g_gpu_resources != nullptr && IsGpuAddressRange(vaddr, size)) {
 		if (!Graphics::GuestGpu::IsGpuThread() ||
-		    GetGpuResources().GetBufferCache().HasGpuDirtyBytes(vaddr, size) ||
 		    GetGpuResources().GetTextureCache().IsRegionGpuModified(vaddr, size)) {
 			return false;
+		}
+		// A prior GPU pass in this frame may still hold the only up-to-date copy of this range
+		// (e.g. a compute-written material table read back through a pointer). Flush and wait
+		// for it instead of refusing the read outright, the same way BufferCache::ReadMemory
+		// already does for other CPU readback paths.
+		if (GetGpuResources().GetBufferCache().HasGpuDirtyBytes(vaddr, size)) {
+			GetGpuResources().GetBufferCache().ReadMemory(vaddr, size);
 		}
 	}
 	return TryReadBacking(vaddr, data, size);
