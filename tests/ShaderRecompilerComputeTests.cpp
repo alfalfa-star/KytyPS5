@@ -14375,6 +14375,17 @@ public:
                   signed_surface.conversion_format ==
                       Prospero::BufferFormat::kInvalid,
               "signed sampled texture class or native backing changed");
+      const auto r8_signed_format = Prospero::BufferFormat::k8SInt;
+      const auto r8_signed_surface =
+          TextureGetSurfaceFormatInfo(r8_signed_format);
+      Require(name, "8-bit signed sampled surface mapping",
+              Prospero::NumBytesPerElement(r8_signed_format) == 1 &&
+                  Prospero::SampledTextureNumericClass(r8_signed_format) ==
+                      Prospero::TextureNumericClass::Sint &&
+                  r8_signed_surface.vk_format == vk::Format::eR8Sint &&
+                  r8_signed_surface.conversion_format ==
+                      Prospero::BufferFormat::kInvalid,
+              "8-bit signed sampled texture class or native backing changed");
     }
 
     {

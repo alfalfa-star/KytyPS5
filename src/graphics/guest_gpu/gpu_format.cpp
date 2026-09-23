@@ -22,6 +22,7 @@ constexpr FormatInfo kFormatInfo[] = {
     {BufferFormat::k8UNorm, 1, 0, 1, true, false},
     {BufferFormat::k8SNorm, 0, 0, 1, false, false},
     {BufferFormat::k8UInt, 1, 0, 1, true, true},
+    {BufferFormat::k8SInt, 1, 0, 1, true, false, true},
     {BufferFormat::k16UNorm, 2, 0, 2, true, false},
     {BufferFormat::k16SNorm, 2, 0, 2, true, false},
     {BufferFormat::k16UInt, 2, 0, 2, true, true},
