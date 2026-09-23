@@ -1065,13 +1065,6 @@ bool EvaluateRuntimeSourcesImpl(const ResourcePlan& program, std::span<const uin
 		if (!evaluate_flat || active[source_index]) {
 			for (uint32_t index = 0; index < source->dword_count; index++) {
 				if (!evaluator.Evaluate(source->dwords[index], value.dwords[index])) {
-					// DIAG
-					const auto* diag_inst = source->dwords[index].Resolve().TryInstruction();
-					std::fprintf(stderr, "DIAG srt eval failed: source=%u dword=%u op=%s\n",
-					             source_index, index,
-					             diag_inst != nullptr
-					                 ? std::string(ValueOpcodeName(diag_inst->GetOpcode())).c_str()
-					                 : "imm");
 					return false;
 				}
 			}
@@ -1087,13 +1080,6 @@ bool EvaluateRuntimeSourcesImpl(const ResourcePlan& program, std::span<const uin
 			auto&      selected = clean ? clean_evaluator : evaluator;
 			if (read.flat_offset >= flattened.size() ||
 			    !selected.Evaluate(read.value, flattened[read.flat_offset])) {
-				// DIAG
-				const auto* diag_inst = read.value.Resolve().TryInstruction();
-				std::fprintf(stderr, "DIAG srt flat eval failed: slot=%u clean=%d op=%s\n",
-				             read.flat_offset, clean,
-				             diag_inst != nullptr
-				                 ? std::string(ValueOpcodeName(diag_inst->GetOpcode())).c_str()
-				                 : "imm");
 				return false;
 			}
 		}

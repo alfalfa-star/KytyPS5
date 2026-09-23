@@ -107,9 +107,6 @@ bool ReadShaderGuestMemory(void*, uint64_t address, uint32_t* value) {
 		*value = 0;
 		return true;
 	}
-	// DIAG
-	std::fprintf(stderr, "DIAG shader memory read refused (GPU-owned): addr=0x%016llx\n",
-	             static_cast<unsigned long long>(address));
 	return false;
 }
 
@@ -366,10 +363,6 @@ struct PipelineCache::ProgramCache {
 			}
 		} else {
 			options.wave_size = input_info.wave_size;
-		}
-		if (Config::GraphicsDebugDumpEnabled()) {
-			// DIAG: keep the guest binary even when decoding aborts.
-			DumpShaderOriginal("pre", options.shader_hash, params.code, "");
 		}
 		auto translated = ShaderRecompiler::TranslateProgram(params.code, options);
 		if (entry == programs.end()) {

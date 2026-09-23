@@ -337,15 +337,6 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		}
 	}
 
-	// DIAG: skip dispatches of listed shader hashes (comma separated hex) to bisect GPU hangs.
-	if (const char* skip = std::getenv("KYTY_DIAG_SKIP_CS"); skip != nullptr) {
-		char hash_text[32];
-		std::snprintf(hash_text, sizeof(hash_text), "%016" PRIx64, program.shader_hash);
-		if (std::strstr(skip, hash_text) != nullptr) {
-			LOGF("DIAG skipping dispatch of shader hash=0x%s\n", hash_text);
-			return;
-		}
-	}
 	if (use_thread_dimensions) {
 		auto groups_from_threads = [](uint32_t threads, uint32_t group_size) {
 			return (threads == 0
@@ -404,16 +395,6 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 
 	// The removed host fence also ordered read-only dispatches before later writers.
 	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
-	// DIAG: full barrier after every dispatch to bisect synchronization hangs.
-	if (const char* full = std::getenv("KYTY_DIAG_FULL_BARRIER");
-	    full != nullptr && std::strstr(full, "dispatch") != nullptr) {
-		vk::MemoryBarrier barrier {};
-		barrier.srcAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
-		barrier.dstAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
-		vk_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
-		                          vk::PipelineStageFlagBits::eAllCommands, {}, 1, &barrier, 0,
-		                          nullptr, 0, nullptr);
-	}
 	ResetBindings();
 }
 

@@ -1067,22 +1067,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
                                          vk::PrimitiveTopology topology, const DrawEmitInfo& emit,
                                          const DrawIndexBufferSource& index_source,
                                          bool                         primitive_restart_enable) {
-	auto& ucfg = buffer.GetUserConfig();
-	// DIAG: skip draws whose vertex or pixel shader hash is listed (comma separated hex).
-	if (const char* skip = std::getenv("KYTY_DIAG_SKIP_DRAW"); skip != nullptr) {
-		const auto listed = [&](const ShaderRecompiler::IR::CompiledShaderInfo* program) {
-			if (program == nullptr) {
-				return false;
-			}
-			char hash_text[32];
-			std::snprintf(hash_text, sizeof(hash_text), "%016" PRIx64, program->shader_hash);
-			return std::strstr(skip, hash_text) != nullptr;
-		};
-		if (listed(state.vertex_info[0].stage.program) ||
-		    listed(state.ps_input_info.stage.program)) {
-			return;
-		}
-	}
+	auto&      ucfg = buffer.GetUserConfig();
 	const auto vertex_stages =
 	    std::span {state.vertex_info.data(), state.programs.VertexStageCount()};
 	const bool mesh_active = state.vertex_info[0].stage.program->stage == ShaderType::Mesh;
@@ -1230,25 +1215,6 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		m_context.GetCommandScheduler().EndRendering();
 		ShaderWriteBarrier(vk_buffer, shader_write_stages);
 	}
-	// DIAG: full barrier after every draw to bisect synchronization hangs.
-	if (const char* full = std::getenv("KYTY_DIAG_FULL_BARRIER");
-	    full != nullptr && (std::strstr(full, "draw") != nullptr)) {
-		m_context.GetCommandScheduler().EndRendering();
-		if (std::strstr(full, "endonly") != nullptr) {
-			goto diag_done;
-		}
-		vk::MemoryBarrier barrier {};
-		barrier.srcAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
-		barrier.dstAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
-		const bool attachments_only = std::strstr(full, "att") != nullptr;
-		vk_buffer.pipelineBarrier(
-		    attachments_only ? vk::PipelineStageFlagBits::eColorAttachmentOutput |
-		                           vk::PipelineStageFlagBits::eEarlyFragmentTests |
-		                           vk::PipelineStageFlagBits::eLateFragmentTests
-		                     : vk::PipelineStageFlagBits::eAllCommands,
-		    vk::PipelineStageFlagBits::eAllCommands, {}, 1, &barrier, 0, nullptr, 0, nullptr);
-	}
-diag_done:
 	LogDrawPhase(draw.Name(), "DrawComplete");
 	if (!draw.IsIndexed()) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x700u);
