@@ -1244,6 +1244,16 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 				                      builtin(IR::StageInputKind::PackedAncillary));
 			}
 		} else if (options.stage == ShaderType::Vertex) {
+			// The merged ES/GS prologue rebuilds EXEC as ~0 >> (64 - s3[7:0]). Report the host
+			// invocations actually running: a zero count shifts by 64, which the hardware reads
+			// as a full wave, and a partial host wave would then enable lanes that do not exist
+			// (a readlane waterfall over such a mask never terminates).
+			const auto active =
+			    entry_ir.IAdd(IR::U32(entry_ir.Emit(IR::ValueOpcode::BitCount32,
+			                                        {entry_ir.CompositeExtract(initial_mask, 0)})),
+			                  IR::U32(entry_ir.Emit(IR::ValueOpcode::BitCount32,
+			                                        {entry_ir.CompositeExtract(initial_mask, 1)})));
+			entry_ir.SetScalarReg(static_cast<IR::ScalarReg>(3), active);
 			entry_ir.SetVectorReg(static_cast<IR::VectorReg>(5),
 			                      builtin(IR::StageInputKind::VertexIndex));
 			entry_ir.SetVectorReg(static_cast<IR::VectorReg>(8),
