@@ -1190,6 +1190,8 @@ struct TestCase {
   bool has_user_data = false;
   u32 image_descriptor_swizzle = DstSel(4, 5, 6, 7);
   bool compile_only = false;
+  // Needs the shaderFloat64 device feature; skipped where the device lacks it.
+  bool requires_float64 = false;
   size_t storage_buffer_range_dwords = 0;
   std::vector<u32> storage_buffer_offsets;
   std::vector<BdaMapping> bda_mappings;
@@ -1430,6 +1432,9 @@ void CheckSpirvText(const TestCase &test, const std::vector<u32> &spirv) {
     Fail(test.name, "SPIR-V disassembly",
          "failed to disassemble emitted SPIR-V");
   }
+  if (std::getenv("KYTY_TEST_DUMP_SPIRV") != nullptr) {
+    std::printf("---- SPIR-V %s ----\n%s\n---- end ----\n", test.name, text.c_str());
+  }
   for (const auto &required : test.required_spirv) {
     if (text.find(required) == std::string::npos) {
       Fail(test.name, "SPIR-V disassembly",
@@ -1483,6 +1488,7 @@ CompiledShader CompileCase(const TestCase &test, u32 host_subgroup_size = 64) {
       .shader_base = reinterpret_cast<uint64_t>(test.code.data()),
       .read_memory = ReadTestMemory,
       .userdata = const_cast<std::vector<u32> *>(&test.initial),
+      .read_specialization_memory = ReadTestMemory,
   };
   Require(test.name, "resource materialization",
           ShaderRecompiler::IR::MaterializeResources(
@@ -1777,6 +1783,8 @@ public:
 
   VulkanHarness(const VulkanHarness &) = delete;
   VulkanHarness &operator=(const VulkanHarness &) = delete;
+
+  [[nodiscard]] bool SupportsFloat64() const { return m_supports_float64; }
 
   struct Buffer {
     vk::Buffer buffer = nullptr;
@@ -9996,14 +10004,23 @@ public:
                 std::end(overwide_mipped_storage.fields),
                 overwide_mipped_storage_descriptor.dwords.begin());
       overwide_mipped_storage_descriptor.dword_count = 8;
-#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
-      ExpectFatal("MipViewPhysicalLayoutChange", [&] {
+      {
+        // A requested last level past MaxMip with a tiling that cannot alias the extra level
+        // onto already-resident data (linear mips are laid out sequentially, so widening always
+        // needs more bytes than are physically allocated) must clamp back down to what is
+        // resident -- matching how the texture/storage-image unit clamps mip access past MaxMip
+        // on real hardware -- rather than fail or read/write memory that was never allocated.
         auto linear_view = overwide_mipped_storage_descriptor;
         linear_view.dwords[3] &= ~(0x1fu << 20u);
-        (void)RenderExecutorTestAccess::ResolveTexture(executor, storage_resource,
-                                                       linear_view);
-      });
-#endif
+        const auto linear_binding = RenderExecutorTestAccess::ResolveTexture(
+            executor, storage_resource, linear_view);
+        Require(name, "mip view past MaxMip clamps instead of failing",
+                linear_binding.desc.view_info.base_level == 1 &&
+                    linear_binding.desc.view_info.level_count == 3 &&
+                    linear_binding.desc.info.resources.levels == 4,
+                "a mip view extending past MaxMip with a non-aliasable tiling should clamp to "
+                "the physically resident range, not fail");
+      }
       auto mipped_storage_resource = storage_resource;
       mipped_storage_resource.mip_mode =
           ShaderRecompiler::IR::ImageMipMode::DynamicStorage;
@@ -15095,6 +15112,10 @@ private:
     device_features.shaderImageGatherExtended = true;
     device_features.sampleRateShading = true;
     device_features.shaderInt64 = true;
+    device_features.shaderStorageBufferArrayDynamicIndexing =
+        available_features.shaderStorageBufferArrayDynamicIndexing;
+    device_features.shaderFloat64 = available_features.shaderFloat64;
+    m_supports_float64 = available_features.shaderFloat64 == true;
     device_features.fillModeNonSolid = true;
     device_info.pEnabledFeatures = &device_features;
     constexpr const char *device_extensions[] = {
@@ -15424,6 +15445,7 @@ private:
     m_device.unmapMemory(buffer.memory);
   }
 
+  bool m_supports_float64 = false;
   vk::Instance m_instance = nullptr;
   vk::PhysicalDevice m_physical_device = nullptr;
   vk::Device m_device = nullptr;
@@ -15475,6 +15497,10 @@ void CompareGraphicsWords(const GraphicsCase &test,
 }
 
 void RunCase(VulkanHarness *vulkan, const TestCase &test) {
+  if (test.requires_float64 && vulkan != nullptr && !vulkan->SupportsFloat64()) {
+    std::printf("[compute] %-32s skipped (no shaderFloat64)\n", test.name);
+    return;
+  }
   auto compiled = CompileCase(test, vulkan != nullptr ? vulkan->SubgroupSize() : 64u);
   if (test.image_descriptor_swizzle != DstSel(4, 5, 6, 7) &&
       !compiled.program.info.images.empty()) {
@@ -15755,6 +15781,9 @@ CoverageClass ClassifyOpcode(ShaderOpcode opcode,
   case Opcode::V_CMP_NGT_F16:
   case Opcode::V_CMP_NEQ_F16:
   case Opcode::V_CMP_NLT_F16:
+  case Opcode::V_CMP_NGE_F16:
+  case Opcode::V_CMP_NLG_F16:
+  case Opcode::V_CMP_NLE_F16:
   case Opcode::V_CMPX_LT_F16:
   case Opcode::V_CMPX_EQ_F16:
   case Opcode::V_CMPX_LE_F16:
@@ -15762,6 +15791,9 @@ CoverageClass ClassifyOpcode(ShaderOpcode opcode,
   case Opcode::V_CMPX_GE_F16:
   case Opcode::V_CMPX_NEQ_F16:
   case Opcode::V_CMPX_NLT_F16:
+  case Opcode::V_CMPX_NGE_F16:
+  case Opcode::V_CMPX_NLG_F16:
+  case Opcode::V_CMPX_NLE_F16:
     return CoverageClass::NeedsFloatCase;
 
   case Opcode::S_LOAD_DWORD:
@@ -15850,6 +15882,11 @@ CoverageClass ClassifyOpcode(ShaderOpcode opcode,
   case Opcode::DS_XOR_B32:
   case Opcode::DS_XOR_RTN_B32:
   case Opcode::DS_WRXCHG_RTN_B32:
+  case Opcode::DS_ADD_U64:
+  case Opcode::DS_SUB_U64:
+  case Opcode::DS_AND_B64:
+  case Opcode::DS_OR_B64:
+  case Opcode::DS_XOR_B64:
   case Opcode::DS_SWIZZLE_B32:
   case Opcode::DS_BPERMUTE_B32:
   case Opcode::DS_READ_I8:
@@ -15889,6 +15926,8 @@ CoverageClass ClassifyOpcode(ShaderOpcode opcode,
   case Opcode::IMAGE_ATOMIC_AND:
   case Opcode::IMAGE_ATOMIC_OR:
   case Opcode::IMAGE_ATOMIC_XOR:
+  case Opcode::IMAGE_ATOMIC_FMIN:
+  case Opcode::IMAGE_ATOMIC_FMAX:
   case Opcode::IMAGE_SAMPLE:
   case Opcode::IMAGE_GATHER4_LZ:
   case Opcode::IMAGE_GATHER4_C:
@@ -19787,6 +19826,48 @@ TestCase VectorPermlane16FetchInactiveFi() {
   return test;
 }
 
+// Ghost of Yotei broadcasts lane 3 of every 8-lane group into a VOP2 add (v_add_f32 dpp8) and
+// into compares; the DPP8 selector form is shared with VOP1.
+TestCase VectorVop2Dpp8CapturedBroadcast() {
+  using O = ShaderOpcode;
+  std::vector<u32> code;
+  // v5 = lane * 1.0 as float, v15 = 1000.0
+  code.push_back(EncodeVop1(0x06, 5, Vgpr(0))); // v_cvt_f32_u32 v5, v0
+  AppendVMovLiteral(&code, 15, 0x447a0000u);
+  // v_add_f32 v16, v5.dpp8(sel 3,3,3,3,3,3,3,3), v15 -- captured from the game
+  code.insert(code.end(), {0x06201ee9u, 0x6db6db05u});
+  // v_cmp_gt_f32 vcc, v5.dpp8(sel 3..), v15  (lane3 value > 1000 is false for all groups)
+  code.insert(code.end(), {EncodeVopc(0x04, 233, 15), 0x6db6db05u});
+  code.push_back(EncodeVop2(0x01, 17, InlineU32(0), 15)); // v_cndmask_b32 v17, 0, v15
+  code.push_back(EncodeVop2(0x1a, 6, InlineU32(2), 0));
+  AppendBufferStoreDword(&code, 16, 6);
+  AppendVMovU32(&code, 7, 64u * sizeof(u32));
+  code.push_back(EncodeVop2(0x25, 6, Vgpr(7), 6));
+  AppendBufferStoreDword(&code, 17, 6);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "VectorVop2Dpp8CapturedBroadcast";
+  test.code = std::move(code);
+  test.expected.resize(128);
+  for (u32 lane = 0; lane < 64; ++lane) {
+    const u32 source = (lane & ~7u) | 3u;
+    test.expected[lane] = std::bit_cast<u32>(static_cast<float>(source) + 1000.0f);
+    test.expected[64u + lane] = 0u;
+  }
+  test.opcodes = {O::V_CVT_F32_U32, O::V_MOV_B32,       O::V_ADD_F32,
+                  O::V_CMP_GT_F32,  O::V_CNDMASK_B32,   O::V_LSHLREV_B32,
+                  O::V_ADD_NC_U32,  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.decoded_counts = {{".dpp8(", 2}};
+  test.compute_info.wave_size = 64;
+  test.compute_info.threads_num[0] = 64;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.has_compute_info = true;
+  return test;
+}
+
 TestCase VectorDpp8Captured(bool masked_exec) {
   using O = ShaderOpcode;
   constexpr u32 sentinel = 0xaaaaaaaau;
@@ -21601,6 +21682,91 @@ TestCase VectorVopcCmpxNgtF16CapturedSdwaExecMask() {
                 {O::V_MOV_B32, O::V_CMPX_NGT_F16, O::BUFFER_STORE_DWORD,
                  O::S_ENDPGM}};
   test.decoded_counts = {{"V_CMPX_NGT_F16", 2}};
+  return test;
+}
+
+// Ghost of Yotei compares an f16 high half against zero with the SDWA form of V_CMPX_NLE_F16;
+// the ordered/unordered complement pairs NGE/NLG/NLE round out the f16 family.
+TestCase VectorVopcCmpxNleF16CapturedSdwaExecMask() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  // v5.hi = +1.0: !(1.0 <= 0) keeps the lane.
+  AppendVMovLiteral(&code, 5, 0x3c000000u);
+  AppendVMovU32(&code, 3, 7);
+  AppendVMovU32(&code, 30, 0);
+  code.insert(code.end(), {0x7df900f9u, 0x86050005u});
+  AppendBufferStoreDword(&code, 3, 30);
+  // v5.hi = NaN: unordered, so the lane stays active.
+  AppendVMovLiteral(&code, 5, 0x7e000000u);
+  AppendVMovU32(&code, 3, 9);
+  AppendVMovU32(&code, 30, 4);
+  code.insert(code.end(), {0x7df900f9u, 0x86050005u});
+  AppendBufferStoreDword(&code, 3, 30);
+  // v5.hi = -1.0: -1.0 <= 0 holds, EXEC drops to zero and the store is skipped.
+  AppendVMovLiteral(&code, 5, 0xbc000000u);
+  AppendVMovU32(&code, 3, 11);
+  AppendVMovU32(&code, 30, 8);
+  code.insert(code.end(), {0x7df900f9u, 0x86050005u});
+  AppendBufferStoreDword(&code, 3, 30);
+  AppendEnd(&code);
+
+  TestCase test{"VectorVopcCmpxNleF16CapturedSdwaExecMask",
+                code,
+                {0x11111111u, 0x22222222u, 0x33333333u},
+                {7, 9, 0x33333333u},
+                {O::V_MOV_B32, O::V_CMPX_NLE_F16, O::BUFFER_STORE_DWORD,
+                 O::S_ENDPGM}};
+  test.decoded_counts = {{"V_CMPX_NLE_F16", 3}};
+  test.required_spirv = {"OpFUnordGreaterThan"};
+  return test;
+}
+
+TestCase VectorVopcCmpUnorderedF16Family() {
+  using O = ShaderOpcode;
+  struct CompareCase {
+    u32 opcode;
+    u32 packed; // low half = src0 (v3), high half = src1 (v1)
+    u32 expected;
+  };
+  const std::array<CompareCase, 12> cases{{
+      {0xe9u, 0x40003c00u, 1}, // NGE: !(1 >= 2) = 1
+      {0xe9u, 0x3c004000u, 0}, // NGE: !(2 >= 1) = 0
+      {0xe9u, 0x7e003c00u, 1}, // NGE with NaN = 1
+      {0xeau, 0x3c003c00u, 1}, // NLG: !(1 <> 1) = 1
+      {0xeau, 0x40003c00u, 0}, // NLG: !(1 <> 2) = 0
+      {0xeau, 0x3c007e00u, 1}, // NLG with NaN = 1
+      {0xecu, 0x40003c00u, 0}, // NLE: !(1 <= 2) = 0
+      {0xecu, 0x3c004000u, 1}, // NLE: !(2 <= 1) = 1
+      {0xecu, 0x3c003c00u, 0}, // NLE: !(1 <= 1) = 0
+      {0xecu, 0x7e003c00u, 1}, // NLE with NaN in src0 = 1
+      {0xecu, 0x3c007e00u, 1}, // NLE with NaN in src1 = 1
+      {0xecu, 0xfc007c00u, 1}, // NLE: !(+inf <= -inf) = 1
+  }};
+  TestCase test;
+  test.name = "VectorVopcCmpUnorderedF16Family";
+  for (const auto &entry : cases) {
+    test.initial.push_back(entry.packed);
+  }
+  test.expected = test.initial;
+  auto &code = test.code;
+  for (u32 i = 0; i < cases.size(); ++i) {
+    const auto &entry = cases[i];
+    AppendVMovU32(&code, 30, i * 4u);
+    AppendBufferLoadDword(&code, 3, 30); // Runtime input prevents constant folding.
+    AppendVMovU32(&code, 1, entry.packed >> 16u);
+    code.push_back(EncodeVopc(entry.opcode, Vgpr(3), 1));
+    AppendStoreSgpr(&code, 106, static_cast<u32>(cases.size()) + i);
+    test.expected.push_back(entry.expected);
+  }
+  AppendEnd(&code);
+  test.opcodes = {O::V_MOV_B32,     O::BUFFER_LOAD_DWORD, O::V_CMP_NGE_F16,
+                  O::V_CMP_NLG_F16, O::V_CMP_NLE_F16,     O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
+  test.decoded_counts = {{"V_CMP_NGE_F16", 3}, {"V_CMP_NLG_F16", 3},
+                         {"V_CMP_NLE_F16", 6}};
+  test.compute_info.wave_size = 32;
+  test.has_compute_info = true;
   return test;
 }
 
@@ -23586,6 +23752,77 @@ TestCase FlatVirtualAddressRebasesGuestAllocation() {
   return test;
 }
 
+// A GPU-driven binning pass (Ghost of Yotei): a scalar loop walks a table of V#s in the SRT
+// and stores through each one. The V# is only known at runtime, so the host enumerates the
+// table up to the loop bound and the shader selects the dense buffer by key.
+TestCase LoopIndexedBufferTableStoresThroughEachEntry() {
+  using O = ShaderOpcode;
+
+  constexpr u32 count_offset = 32;   // count = 2
+  constexpr u32 table_offset = 64;   // two V#s, 16 bytes each
+  constexpr u32 first_base = 0x80;   // dword 32
+  constexpr u32 second_base = 0xc0;  // dword 48
+  constexpr u32 record_bytes = 32;
+
+  std::vector<u32> code;
+  code.push_back(EncodeSMovB32(3, InlineU32(0)));
+  const auto loop = static_cast<u32>(code.size());
+  // count = *(srt + 32)
+  code.push_back(EncodeSmem0(0x00, 8, 0));
+  code.push_back(EncodeSmem1(count_offset, 0x7d));
+  code.push_back(EncodeSopp(0x0c, 0));
+  // while (i < count)
+  code.push_back(EncodeSopc(0x0a, 3, 8));
+  const auto exit_branch = static_cast<u32>(code.size());
+  code.push_back(EncodeSopp(0x04, 0));
+  // V# = *(srt + 64 + i * 16)
+  code.push_back(EncodeSop2(0x1e, 9, 3, InlineU32(4)));
+  code.push_back(EncodeSop2(0x00, 9, 9, InlineU32(64)));
+  code.push_back(EncodeSmem0(0x02, 4, 0));
+  code.push_back(EncodeSmem1(0, 9));
+  code.push_back(EncodeSopp(0x0c, 0));
+  // buffer_store_dword (64 + i), offset 0, V#
+  code.push_back(EncodeVop1(0x01, 0, 3));
+  code.push_back(EncodeVop2(0x25, 0, InlineU32(64), 0));
+  code.push_back(EncodeVop1(0x01, 1, InlineU32(0)));
+  code.push_back(EncodeMubuf0(0x1c, 0, false, true));
+  code.push_back(EncodeMubuf1(0, 1, 1));
+  // i++
+  code.push_back(EncodeSop2(0x00, 3, 3, InlineU32(1)));
+  const auto back_branch = static_cast<u32>(code.size());
+  code.push_back(EncodeSopp(0x02, static_cast<u32>(loop - (back_branch + 1u)) & 0xffffu));
+  const auto exit = static_cast<u32>(code.size());
+  code[exit_branch] = EncodeSopp(0x04, exit - (exit_branch + 1u));
+  AppendEnd(&code);
+
+  std::vector<u32> initial(112, 0xdeadbeefu);
+  initial[count_offset / 4] = 2;
+  const std::array<u32, 8> table{first_base,  0, record_bytes, 0,
+                                 second_base, 0, record_bytes, 0};
+  std::copy(table.begin(), table.end(), initial.begin() + table_offset / 4);
+  auto expected = initial;
+  expected[first_base / 4] = 64;
+  expected[second_base / 4] = 65;
+
+  TestCase test;
+  test.name = "LoopIndexedBufferTableStoresThroughEachEntry";
+  test.code = std::move(code);
+  test.initial = std::move(initial);
+  test.expected = std::move(expected);
+  test.opcodes = {O::S_MOV_B32,   O::S_LOAD_DWORD,    O::S_WAITCNT,
+                  O::S_CMP_LT_U32, O::S_CBRANCH_SCC0, O::S_LSHL_B32,
+                  O::S_ADD_U32,   O::S_LOAD_DWORDX4,  O::V_MOV_B32,
+                  O::V_ADD_NC_U32, O::BUFFER_STORE_DWORD, O::S_BRANCH,
+                  O::S_ENDPGM};
+  // Every dense buffer aliases the test buffer; the V# base addresses become the byte offsets
+  // the shader adds, so the two table entries land in different records.
+  test.storage_buffer_range_dwords = record_bytes / sizeof(u32);
+  test.storage_buffer_offsets = {first_base, second_base};
+  test.bda_mappings = {{0, 0}};
+  test.required_spirv = {"StorageBufferArrayDynamicIndexing"};
+  return test;
+}
+
 TestCase GlobalSignedImmediateRebasesBeforeSaddr() {
   using O = ShaderOpcode;
 
@@ -24092,6 +24329,83 @@ TestCase DsAtomicNoReturnVariants() {
            O::DS_MIN_I32, O::DS_MAX_I32, O::DS_MIN_U32, O::DS_MAX_U32,
            O::DS_AND_B32, O::DS_OR_B32, O::DS_XOR_B32, O::DS_READ_B32,
            O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+}
+
+TestCase DsAtomicBitwiseB64NoReturn() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovU32(&code, 1, 0);
+  const u32 initial[][2] = {{0xff00ff00u, 0x0f0f0f0fu},
+                            {0x00000001u, 0x80000000u},
+                            {0xffffffffu, 0x00000000u}};
+  const u32 values[][2] = {{0x0ff00ff0u, 0xf0f0f0f0u},
+                           {0x00000002u, 0x00000001u},
+                           {0x0000ffffu, 0xffff0000u}};
+  const u32 ops[] = {0x49, 0x4a, 0x4b};
+  for (u32 i = 0; i < 3u; i++) {
+    AppendVMovLiteral(&code, 2, initial[i][0]);
+    AppendVMovLiteral(&code, 3, initial[i][1]);
+    code.push_back(EncodeDs0(0x4d, i * 8u)); // ds_write_b64
+    code.push_back(EncodeDs1(0, 2, 1));
+    AppendVMovLiteral(&code, 4, values[i][0]);
+    AppendVMovLiteral(&code, 5, values[i][1]);
+    code.push_back(EncodeDs0(ops[i], i * 8u));
+    code.push_back(EncodeDs1(0, 4, 1));
+    code.push_back(EncodeDs0(0x36, i * 8u));
+    code.push_back(EncodeDs1(10u + i * 2u, 0, 1));
+    code.push_back(EncodeDs0(0x36, i * 8u + 4u));
+    code.push_back(EncodeDs1(11u + i * 2u, 0, 1));
+  }
+  for (u32 i = 0; i < 6u; i++) {
+    AppendStoreVgpr(&code, 10u + i, i);
+  }
+  AppendEnd(&code);
+
+  return {"DsAtomicBitwiseB64NoReturn",
+          code,
+          std::vector<u32>(6, 0),
+          {0x0f000f00u, 0x00000000u, 0x00000003u, 0x80000001u, 0xffff0000u,
+           0xffff0000u},
+          {O::V_MOV_B32, O::DS_WRITE_B64, O::DS_AND_B64, O::DS_OR_B64,
+           O::DS_XOR_B64, O::DS_READ_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+}
+
+TestCase DsAtomicAddSubU64NoReturnCarries() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovU32(&code, 1, 0);
+  // {initial lo, hi} then {operand lo, hi}; add first, subtract second.
+  const u32 initial[][2] = {{0xffffffffu, 0x00000001u}, {0x00000000u, 0x00000002u}};
+  const u32 values[][2] = {{0x00000002u, 0x00000003u}, {0x00000001u, 0x00000001u}};
+  const u32 ops[] = {0x40, 0x41};
+  for (u32 i = 0; i < 2u; i++) {
+    AppendVMovLiteral(&code, 2, initial[i][0]);
+    AppendVMovLiteral(&code, 3, initial[i][1]);
+    code.push_back(EncodeDs0(0x4d, i * 8u)); // ds_write_b64
+    code.push_back(EncodeDs1(0, 2, 1));
+    AppendVMovLiteral(&code, 4, values[i][0]);
+    AppendVMovLiteral(&code, 5, values[i][1]);
+    code.push_back(EncodeDs0(ops[i], i * 8u));
+    code.push_back(EncodeDs1(0, 4, 1));
+    code.push_back(EncodeDs0(0x36, i * 8u));
+    code.push_back(EncodeDs1(10u + i * 2u, 0, 1));
+    code.push_back(EncodeDs0(0x36, i * 8u + 4u));
+    code.push_back(EncodeDs1(11u + i * 2u, 0, 1));
+  }
+  for (u32 i = 0; i < 4u; i++) {
+    AppendStoreVgpr(&code, 10u + i, i);
+  }
+  AppendEnd(&code);
+
+  // 0x1_ffffffff + 0x3_00000002 = 0x5_00000001; 0x2_00000000 - 0x1_00000001 = 0x0_ffffffff.
+  return {"DsAtomicAddSubU64NoReturnCarries",
+          code,
+          std::vector<u32>(4, 0),
+          {0x00000001u, 0x00000005u, 0xffffffffu, 0x00000000u},
+          {O::V_MOV_B32, O::DS_WRITE_B64, O::DS_ADD_U64, O::DS_SUB_U64,
+           O::DS_READ_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
 TestCase DsAtomicReturnVariants() {
@@ -26013,8 +26327,8 @@ void CheckIndirectImageKeySwitch() {
 
   program.descriptor_sources.resize(2);
   program.descriptor_sources[0].dword_count = 8;
-  program.descriptor_sources[0].indirect_image =
-      DescriptorSource::IndirectImage{0u, 0u, 224u, 12u, 0u};
+  program.descriptor_sources[0].indirect_table =
+      DescriptorSource::IndirectTable{0u, 0u, 224u, 12u, 0u};
   program.descriptor_sources[1].dword_count = 4;
 
   ImageResource root{};
@@ -26520,6 +26834,89 @@ TestCase ImageAtomicVariants() {
   test.expected_storage_image_r32ui[2] = 0x00f0u;
   test.expected_storage_image_r32ui[3] = 0xff00u;
   test.expected_storage_image_r32ui[4] = 0xf0f0u;
+  return test;
+}
+
+TestCase DoubleConvertMulRcpFma() {
+  using O = ShaderOpcode;
+
+  // The compiler's exact integer-division idiom: convert to double, multiply by a reciprocal
+  // and refine with a negated-operand FMA, then narrow. a = -6, b = 4.
+  std::vector<u32> code;
+  AppendVMovLiteral(&code, 10, 0xfffffffau);
+  AppendVMovU32(&code, 11, 4);
+  code.push_back(EncodeVop1(0x04, 0, Vgpr(10)));  // v[0:1] = (double)-6
+  code.push_back(EncodeVop1(0x04, 2, Vgpr(11)));  // v[2:3] = (double)4
+  code.push_back(EncodeVop3Word0(0x165, 4));      // v[4:5] = v[0:1] * v[2:3] = -24.0
+  code.push_back(EncodeVop3Word1(Vgpr(0), Vgpr(2)));
+  code.push_back(EncodeVop1(0x2f, 6, Vgpr(2)));   // v[6:7] = 1 / 4.0 = 0.25
+  code.push_back(EncodeVop3Word0(0x14c, 8));      // v[8:9] = fma(-24.0, 0.25, -4.0) = -10.0
+  code.push_back(EncodeVop3Word1(Vgpr(4), Vgpr(6), Vgpr(2), 0, 4u));
+  code.push_back(EncodeVop1(0x0f, 12, Vgpr(8)));  // v12 = (float)-10.0
+  code.push_back(EncodeVop1(0x0f, 13, Vgpr(6)));  // v13 = (float)0.25
+  AppendStoreVgpr(&code, 12, 0);
+  AppendStoreVgpr(&code, 13, 1);
+  AppendStoreVgpr(&code, 4, 2);
+  AppendStoreVgpr(&code, 5, 3);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "DoubleConvertMulRcpFma";
+  test.code = code;
+  test.expected = {0xc1200000u, 0x3e800000u, 0x00000000u, 0xc0380000u};
+  test.opcodes = {O::V_MOV_B32,   O::V_CVT_F64_I32, O::V_MUL_F64,
+                  O::V_RCP_F64,   O::V_FMA_F64,     O::V_CVT_F32_F64,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.required_spirv = {"OpCapability Float64", "OpTypeFloat 64", "OpConvertSToF",
+                         "OpFConvert", "OpFDiv", "Fma"};
+  test.requires_float64 = true;
+  return test;
+}
+
+TestCase ImageAtomicFloatMinMax() {
+  using O = ShaderOpcode;
+
+  // Texel 0: fmax(2.0, 5.0) -> 5.0. Texel 1: fmax(5.0, 2.0) stays 5.0. Texel 2: fmin(2.0,
+  // -3.0) -> -3.0. Texel 3: fmin(-3.0, 2.0) stays -3.0 (negative floats order below positive
+  // ones by value, not by raw bits). Texel 4: fmax(-0.0, +0.0) keeps the stored value.
+  const u32 initial[] = {0x40000000u, 0x40a00000u, 0x40000000u, 0xc0400000u, 0x80000000u};
+  const u32 values[] = {0x40a00000u, 0x40000000u, 0xc0400000u, 0x40000000u, 0x00000000u};
+  const u32 ops[] = {0x1f, 0x1f, 0x1e, 0x1e, 0x1f};
+
+  std::vector<u32> code;
+  for (u32 i = 0; i < static_cast<u32>(std::size(values)); i++) {
+    AppendVMovU32(&code, 20, i & 3u);
+    AppendVMovU32(&code, 21, i >> 2u);
+    AppendVMovU32(&code, 22, 0);
+    AppendVMovLiteral(&code, 0, values[i]);
+    code.push_back(EncodeMimg0(ops[i], 0x1, 0, true));
+    code.push_back(EncodeMimg1(0, 20));
+    AppendStoreVgpr(&code, 0, i);
+  }
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "ImageAtomicFloatMinMax";
+  test.code = code;
+  // GLC returns the previous texel value.
+  test.expected = {0x40000000u, 0x40a00000u, 0x40000000u, 0xc0400000u, 0x80000000u};
+  test.opcodes = {O::V_MOV_B32, O::IMAGE_ATOMIC_FMAX, O::IMAGE_ATOMIC_FMIN,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.required_spirv = {"OpImageTexelPointer", "OpAtomicCompareExchange", "R32ui",
+                         StorageUint2DImageBindingName(true)};
+  test.forbidden_spirv = {"OpAtomicFMaxEXT", "OpAtomicFMinEXT", "OpTypeSampler",
+                          StorageUint2DImageBindingName(false)};
+  test.storage_image_rgba = MakeRgbaImage(4, 4);
+  test.storage_image_r32ui = std::vector<u32>(16, 0);
+  for (u32 i = 0; i < static_cast<u32>(std::size(initial)); i++) {
+    test.storage_image_r32ui[i] = initial[i];
+  }
+  test.expected_storage_image_r32ui = std::vector<u32>(16, 0);
+  test.expected_storage_image_r32ui[0] = 0x40a00000u;
+  test.expected_storage_image_r32ui[1] = 0x40a00000u;
+  test.expected_storage_image_r32ui[2] = 0xc0400000u;
+  test.expected_storage_image_r32ui[3] = 0xc0400000u;
+  test.expected_storage_image_r32ui[4] = 0x80000000u;
   return test;
 }
 
@@ -27102,6 +27499,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorPermlane16FetchInactiveZero);
   AddCase(VectorPermlane16FetchInactiveFi);
   cases.push_back(VectorDpp8Captured(false));
+  AddCase(VectorVop2Dpp8CapturedBroadcast);
   cases.push_back(VectorDpp8Captured(true));
   AddCase(VectorDppQuadPermuteReverse);
   AddCase(VectorDppRowXmask);
@@ -27151,6 +27549,8 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorVopcCmpNgtF16CapturedSdwaAndEdges);
   AddCase(VectorVopcCmpNltF16CapturedSdwaAndEdges);
   AddCase(VectorVopcCmpxNgtF16CapturedSdwaExecMask);
+  AddCase(VectorVopcCmpxNleF16CapturedSdwaExecMask);
+  AddCase(VectorVopcCmpUnorderedF16Family);
   AddCase(VectorCompareInvertedMaskSelect);
   AddCase(BranchSelect);
   AddCase(SimpleLoop);
@@ -27231,6 +27631,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(FlatSubdwordLoadsApplyByteOffset);
   AddCase(FlatVirtualAddressRebasesGuestAllocation);
   AddCase(GlobalSignedImmediateRebasesBeforeSaddr);
+  AddCase(LoopIndexedBufferTableStoresThroughEachEntry);
   AddCase(FlatSegmentIgnoresSaddrAndMasksOffsetMsb);
   AddCase(ScratchIsPrivatePerInvocation);
   AddCase(DsReadWriteVariants);
@@ -27247,6 +27648,8 @@ std::vector<TestCase> MakeCases() {
   AddCase(DsWideGdsPartialBounds);
   AddCase(DsAtomicNoReturnVariants);
   AddCase(DsAtomicReturnVariants);
+  AddCase(DsAtomicBitwiseB64NoReturn);
+  AddCase(DsAtomicAddSubU64NoReturnCarries);
   for (bool decrement : {false, true}) {
     for (bool gds : {false, true}) {
       cases.push_back(DsBoundedAtomicBoundaries(decrement, gds));
@@ -27314,6 +27717,8 @@ std::vector<TestCase> MakeCases() {
   AddCase(ImageAtomicSwapReturnsPreviousTexel);
   AddCase(ImageStoreAndAtomicUseSeparateBindings);
   AddCase(ImageAtomicVariants);
+  AddCase(ImageAtomicFloatMinMax);
+  AddCase(DoubleConvertMulRcpFma);
   AddCase(ImageAtomicGlc0DoesNotReturnOldValue);
   AddCase(MultipleWorkitemsGlobalId);
   AddCase(DispatcherIrreducibleControlFlow);
@@ -32193,6 +32598,21 @@ int main(int argc, char **argv) {
     vulkan.CheckComparisonDepthTexture();
     vulkan.CheckRasterization(true);
     RunCase(nullptr, ImageSampleA16CompareBiasRdna2AddressOrder());
+    return 0;
+  }
+  if (argc == 3 && std::strcmp(argv[1], "--case") == 0) {
+    VulkanHarness vulkan;
+    bool          found = false;
+    for (const auto &test : MakeCases()) {
+      if (std::strcmp(test.name, argv[2]) == 0) {
+        RunCase(&vulkan, test);
+        found = true;
+      }
+    }
+    if (!found) {
+      std::printf("ShaderRecompilerComputeTests: no case named %s\n", argv[2]);
+      return 1;
+    }
     return 0;
   }
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS

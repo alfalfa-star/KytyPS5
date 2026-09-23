@@ -448,6 +448,18 @@ uint32_t EmitFPMaxTri32(EmitterState& state, uint32_t arg0, uint32_t arg1, uint3
 	return EmitFMinMax3(state, arg0, arg1, arg2, true);
 }
 
+uint32_t EmitConvertF64S32(EmitterState& state, uint32_t arg0) {
+	const auto signed_value = Unary(state, spv::OpBitcast, TypeI32(state), arg0);
+	return EmitNative<spv::OpConvertSToF, IR::Type::F64>(state, signed_value);
+}
+
+uint32_t EmitFPRecip64(EmitterState& state, uint32_t arg0) {
+	// V_RCP_F64 is only an approximation that shaders refine with FMA steps; the exact
+	// quotient satisfies those steps trivially.
+	const auto one = state.builder.Constant(spv::OpConstant, TypeF64(state), 0u, 0x3ff00000u);
+	return Binary(state, spv::OpFDiv, TypeF64(state), one, arg0);
+}
+
 uint32_t EmitFPRecip32(EmitterState& state, uint32_t arg0) {
 	const auto source = EmitFlushF32DenormToSignedZero(state, arg0);
 	return Binary(state, spv::OpFDiv, TypeF32(state), ConstantF32(state, 0x3f800000u), source);

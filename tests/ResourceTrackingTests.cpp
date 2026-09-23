@@ -275,7 +275,7 @@ void TestInvariantIndirectImageMaterialization() {
   const auto source = fixture->program.info.images[0].source;
   Check(source < fixture->program.descriptor_sources.size() &&
             fixture->program.descriptor_sources[source]
-                .indirect_image.has_value(),
+                .indirect_table.has_value(),
         "indirect image source was not retained for runtime proof");
   const auto image_handle =
       std::ranges::find_if(*fixture->block, [](const Inst &inst) {
@@ -466,7 +466,7 @@ void TestInvariantIndirectImageMaterialization() {
   Check(wrapped_source < wrapped_immediate->program.descriptor_sources.size(),
         "material key at a fixed non-zero SMEM offset lost its descriptor source");
   const auto &wrapped_indirect =
-      wrapped_immediate->program.descriptor_sources[wrapped_source].indirect_image;
+      wrapped_immediate->program.descriptor_sources[wrapped_source].indirect_table;
   Check(wrapped_indirect.has_value() && wrapped_indirect->selector_offset == 0u &&
             wrapped_indirect->material_offset == 4u,
         "fixed SMEM immediate offset was not captured on the indirect image plan");

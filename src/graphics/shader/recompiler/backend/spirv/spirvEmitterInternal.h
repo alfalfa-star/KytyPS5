@@ -25,11 +25,11 @@
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 
-struct InputBinding : IR::StageInput {
+struct InputBinding: IR::StageInput {
 	uint32_t variable_id = 0;
 };
 
-struct OutputBinding : IR::StageOutput {
+struct OutputBinding: IR::StageOutput {
 	uint32_t variable_id        = 0;
 	uint32_t mesh_data_variable = 0;
 };
@@ -67,6 +67,7 @@ struct SpirvRequirements {
 	bool function_scratch             = false;
 	bool pixel_valid_mask             = false;
 	bool buffer_int64_atomics         = false;
+	bool buffer_dynamic_indexing      = false;
 };
 
 SpirvRequirements AnalyzeProgramRequirements(const IR::Program& program);
@@ -77,54 +78,61 @@ struct EmitterState {
 	      program(program_), input_info(input_info_),
 	      requirements(AnalyzeProgramRequirements(program_)) {}
 
-	Builder                                          builder;
-	const IR::Program&                               program;
-	ShaderStageInputInfo                             input_info;
-	std::array<uint32_t, 6>                          tess_variables {};
-	uint32_t                                         tess_inner_variable = 0;
-	uint32_t                                         tess_patch_base     = 0;
+	Builder                 builder;
+	const IR::Program&      program;
+	ShaderStageInputInfo    input_info;
+	std::array<uint32_t, 6> tess_variables {};
+	uint32_t                tess_inner_variable = 0;
+	uint32_t                tess_patch_base     = 0;
 
 	const SpirvRequirements                          requirements;
-	uint32_t                                         lane_count              = 1;
-	uint32_t                                         lane_half               = 0;
-	uint32_t                                         storage_buffer_variable = 0;
+	uint32_t                                         lane_count                  = 1;
+	uint32_t                                         lane_half                   = 0;
+	uint32_t                                         storage_buffer_variable     = 0;
 	uint32_t                                         storage_buffer_u64_variable = 0;
 	std::array<uint32_t, IR::ShaderInfo::MaxBuffers> memory_byte_offsets {};
-	uint32_t                                         bda_pagetable_variable  = 0;
-	uint32_t                                         fault_buffer_variable   = 0;
-	uint32_t                                         bda_pointer_function    = 0;
-	uint32_t                                         gds_variable            = 0;
-	uint32_t                                         gds_length              = 0;
-	uint32_t                                         push_constant_variable  = 0;
-	uint32_t                                         shader_data_storage_variable = 0;
-	uint32_t                                         flattened_srt_variable  = 0;
-	uint32_t                                         lds_variable            = 0;
-	std::array<uint32_t, 2>                          scratch_variable {};
-	std::array<uint32_t, IR::ImageBindingCount>      image_variables {};
-	uint32_t                   sampler_variable                      = 0;
-	uint32_t                   main_func                             = 0;
-	uint32_t                   mesh_guest_func                       = 0;
-	uint32_t                   mesh_allocation                       = 0;
-	uint32_t                   mesh_primitive_data                   = 0;
-	uint32_t                   mesh_primitives                       = 0;
-	uint32_t                   mesh_cull                             = 0;
-	uint32_t                   entry_label                           = 0;
-	uint32_t                   current_label                         = 0;
-	const IR::Block*           current_block                         = nullptr;
-	uint32_t                   pixel_valid_mask_variable             = 0;
-	uint32_t                   subgroup_local_invocation_id_variable = 0;
-	uint32_t                   per_vertex_variable                   = 0;
-	uint32_t                   point_size_variable                   = 0;
-	uint32_t                   clip_distance_variable                = 0;
-	uint32_t                   invalid_position_clip_distance        = UINT32_MAX;
-	uint32_t                   cull_distance_variable                = 0;
-	uint32_t                   layer_variable                        = 0;
-	uint32_t                   viewport_index_variable               = 0;
-	uint32_t                   depth_variable                        = 0;
-	uint32_t                   sample_mask_variable                  = 0;
-	std::vector<InputBinding>  inputs;
-	std::vector<OutputBinding> outputs;
-	std::vector<uint32_t>      interface_variables;
+	// The buffer-table entry the memory operation being emitted selected by key: the storage
+	// buffer array index and its byte offset are SPIR-V values rather than dense constants.
+	struct IndirectBufferSelection {
+		uint32_t resource    = UINT32_MAX;
+		uint32_t array_index = 0;
+		uint32_t byte_offset = 0;
+	} indirect_buffer;
+	uint32_t                                       bda_pagetable_variable       = 0;
+	uint32_t                                       fault_buffer_variable        = 0;
+	uint32_t                                       bda_pointer_function         = 0;
+	uint32_t                                       gds_variable                 = 0;
+	uint32_t                                       gds_length                   = 0;
+	uint32_t                                       push_constant_variable       = 0;
+	uint32_t                                       shader_data_storage_variable = 0;
+	uint32_t                                       flattened_srt_variable       = 0;
+	uint32_t                                       lds_variable                 = 0;
+	std::array<uint32_t, 2>                        scratch_variable {};
+	std::array<uint32_t, IR::ImageBindingCount>    image_variables {};
+	uint32_t                                       sampler_variable                      = 0;
+	uint32_t                                       main_func                             = 0;
+	uint32_t                                       mesh_guest_func                       = 0;
+	uint32_t                                       mesh_allocation                       = 0;
+	uint32_t                                       mesh_primitive_data                   = 0;
+	uint32_t                                       mesh_primitives                       = 0;
+	uint32_t                                       mesh_cull                             = 0;
+	uint32_t                                       entry_label                           = 0;
+	uint32_t                                       current_label                         = 0;
+	const IR::Block*                               current_block                         = nullptr;
+	uint32_t                                       pixel_valid_mask_variable             = 0;
+	uint32_t                                       subgroup_local_invocation_id_variable = 0;
+	uint32_t                                       per_vertex_variable                   = 0;
+	uint32_t                                       point_size_variable                   = 0;
+	uint32_t                                       clip_distance_variable                = 0;
+	uint32_t                                       invalid_position_clip_distance = UINT32_MAX;
+	uint32_t                                       cull_distance_variable         = 0;
+	uint32_t                                       layer_variable                 = 0;
+	uint32_t                                       viewport_index_variable        = 0;
+	uint32_t                                       depth_variable                 = 0;
+	uint32_t                                       sample_mask_variable           = 0;
+	std::vector<InputBinding>                      inputs;
+	std::vector<OutputBinding>                     outputs;
+	std::vector<uint32_t>                          interface_variables;
 	std::unordered_map<const IR::Block*, uint32_t> labels;
 };
 
@@ -138,6 +146,7 @@ uint32_t TypeU32Pair(EmitterState& state);
 uint32_t TypeI32(EmitterState& state);
 uint32_t TypeI32Pair(EmitterState& state);
 uint32_t TypeF32(EmitterState& state);
+uint32_t TypeF64(EmitterState& state);
 uint32_t TypeU32Vector(EmitterState& state, uint32_t components);
 
 uint32_t TypeU32Composite(EmitterState& state, uint32_t components);
@@ -261,7 +270,6 @@ uint32_t VertexParameterComponentCount(const InputBinding& input);
 
 uint32_t VertexParameterScalarType(EmitterState& state, VertexInputScalarKind kind);
 
-
 uint32_t OutputVariableForExport(const EmitterState& state, const IR::ExportInfo& exp);
 
 uint32_t ConstantU32(EmitterState& state, uint32_t value);
@@ -380,6 +388,24 @@ struct MemoryResourceAccess {
 };
 
 MemoryResourceAccess PrepareMemoryResourceAccess(EmitterState& state, const IR::MemoryInfo& mem);
+
+// Binary search of a runtime key in a sorted (key, candidate) mapping stored in the flattened
+// SRT; yields the candidate index, or zero when the key is absent.
+uint32_t EmitIndirectTableSelection(EmitterState& state, uint32_t key, uint32_t mapping_offset,
+                                    uint32_t search_iterations);
+
+// Selects the dense buffer a table-indexed memory operation addresses for the duration of its
+// emission (see EmitterState::indirect_buffer).
+class IndirectBufferScope {
+public:
+	IndirectBufferScope(ValueEmitContext& ctx, const IR::Inst& inst);
+	~IndirectBufferScope();
+	IndirectBufferScope(const IndirectBufferScope&)            = delete;
+	IndirectBufferScope& operator=(const IndirectBufferScope&) = delete;
+
+private:
+	EmitterState& m_state;
+};
 
 MemoryResourceAccess PrepareStorageBufferResourceAccess(EmitterState&         state,
                                                         const IR::MemoryInfo& mem,

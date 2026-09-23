@@ -148,6 +148,9 @@ std::string FormatMimg(const Instruction& inst) {
 		case Opcode::IMAGE_GATHER4_C_O:
 		case Opcode::IMAGE_GATHER4_C_LZ_O:
 		case Opcode::IMAGE_GATHER4H:
+		case Opcode::IMAGE_GATHER4_C_L:
+		case Opcode::IMAGE_GATHER4_L_O:
+		case Opcode::IMAGE_GATHER4_C_L_O:
 			text += fmt::format(" sample_flags={} addr_components={}",
 			                    ImageSampleFlagsToString(inst.image_sample_flags).c_str(),
 			                    inst.image_address_components);
@@ -255,7 +258,7 @@ void DecodeScalarSource(uint32_t code, uint32_t pc, Operand& operand) {
 		case 127u: operand.kind = OperandKind::ExecHi; return;
 		case 239u: operand.kind = OperandKind::PopsExitingWaveId; return;
 		case 248u:
-			operand.kind      = OperandKind::FloatInlineConstant;
+			operand.kind  = OperandKind::FloatInlineConstant;
 			operand.value = std::bit_cast<uint32_t>(0.15915494309189535f);
 			return;
 		case 251u: operand.kind = OperandKind::VccZ; return;
@@ -560,9 +563,10 @@ std::string InstructionToString(const Instruction& inst) {
 			                                               inst.branch_target));
 		case Opcode::S_SUBVECTOR_LOOP_BEGIN:
 		case Opcode::S_SUBVECTOR_LOOP_END:
-			return WithUnsupportedReason(inst, fmt::format(
-			    "0x{:08x}: {} {}, 0x{:08x}", inst.pc, magic_enum::enum_name(inst.opcode),
-			    OperandToString(inst.dst), inst.branch_target));
+			return WithUnsupportedReason(inst, fmt::format("0x{:08x}: {} {}, 0x{:08x}", inst.pc,
+			                                               magic_enum::enum_name(inst.opcode),
+			                                               OperandToString(inst.dst),
+			                                               inst.branch_target));
 		case Opcode::EXP: return WithUnsupportedReason(inst, FormatExp(inst));
 		case Opcode::IMAGE_SAMPLE:
 		case Opcode::IMAGE_STORE:
@@ -574,6 +578,8 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::IMAGE_ATOMIC_AND:
 		case Opcode::IMAGE_ATOMIC_OR:
 		case Opcode::IMAGE_ATOMIC_XOR:
+		case Opcode::IMAGE_ATOMIC_FMIN:
+		case Opcode::IMAGE_ATOMIC_FMAX:
 		case Opcode::IMAGE_LOAD:
 		case Opcode::IMAGE_LOAD_MIP:
 		case Opcode::IMAGE_GET_RESINFO:
@@ -585,7 +591,10 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::IMAGE_GATHER4_LZ_O:
 		case Opcode::IMAGE_GATHER4_C_O:
 		case Opcode::IMAGE_GATHER4_C_LZ_O:
-		case Opcode::IMAGE_GATHER4H: return WithUnsupportedReason(inst, FormatMimg(inst));
+		case Opcode::IMAGE_GATHER4H:
+		case Opcode::IMAGE_GATHER4_C_L:
+		case Opcode::IMAGE_GATHER4_L_O:
+		case Opcode::IMAGE_GATHER4_C_L_O: return WithUnsupportedReason(inst, FormatMimg(inst));
 		case Opcode::S_LOAD_DWORD:
 		case Opcode::S_LOAD_DWORDX2:
 		case Opcode::S_LOAD_DWORDX4:

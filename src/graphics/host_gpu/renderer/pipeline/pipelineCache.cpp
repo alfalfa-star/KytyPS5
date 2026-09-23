@@ -93,8 +93,24 @@ void PipelineCacheLog(fmt::format_string<Args...> format, Args&&... args) {
 }
 
 bool ReadShaderGuestMemory(void*, uint64_t address, uint32_t* value) {
-	return value != nullptr &&
-	       Libs::LibKernel::Memory::TryReadGpuCleanBacking(address, value, sizeof(*value));
+	if (value == nullptr) {
+		return false;
+	}
+	if (Libs::LibKernel::Memory::TryReadGpuCleanBacking(address, value, sizeof(*value))) {
+		return true;
+	}
+	// Descriptor planning walks every pointer the shader could follow, including ones a draw
+	// leaves null on paths it never takes. Unmapped memory reads as zero (a null descriptor)
+	// rather than failing the bind; a GPU-owned range still refuses, so stale data is never used.
+	uint32_t raw = 0;
+	if (!Libs::LibKernel::Memory::TryReadBacking(address, &raw, sizeof(raw))) {
+		*value = 0;
+		return true;
+	}
+	// DIAG
+	std::fprintf(stderr, "DIAG shader memory read refused (GPU-owned): addr=0x%016llx\n",
+	             static_cast<unsigned long long>(address));
+	return false;
 }
 
 void DumpShaderSpirv(const char* stage_name, uint64_t shader_hash,
@@ -350,6 +366,10 @@ struct PipelineCache::ProgramCache {
 			}
 		} else {
 			options.wave_size = input_info.wave_size;
+		}
+		if (Config::GraphicsDebugDumpEnabled()) {
+			// DIAG: keep the guest binary even when decoding aborts.
+			DumpShaderOriginal("pre", options.shader_hash, params.code, "");
 		}
 		auto translated = ShaderRecompiler::TranslateProgram(params.code, options);
 		if (entry == programs.end()) {

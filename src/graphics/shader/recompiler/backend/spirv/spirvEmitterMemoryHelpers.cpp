@@ -76,25 +76,138 @@ static void EnsureLdsStorage(EmitterState& state) {
 	state.builder.AddName(state.lds_variable, "lds_dwords");
 }
 
-MemoryResourceAccess PrepareStorageBufferResourceAccess(EmitterState& state,
-                                                         const IR::MemoryInfo& mem,
-                                                         uint32_t variable,
-                                                         uint32_t pointer_type) {
+MemoryResourceAccess PrepareStorageBufferResourceAccess(EmitterState&         state,
+                                                        const IR::MemoryInfo& mem,
+                                                        uint32_t variable, uint32_t pointer_type) {
 	if (variable == 0) {
 		ExitDescriptorBindingFailure(state, IR::DescriptorBindingKind::Buffers, mem.resource,
 		                             "storage buffer descriptor array was not emitted");
 	}
-	const auto array_index =
-	    ResourceForDescriptor(state, IR::DescriptorBindingKind::Buffers, mem.resource);
 	MemoryResourceAccess access {.kind = mem.kind};
 	access.object_pointer = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpAccessChain, pointer_type, access.object_pointer, variable,
-	                          ConstantU32(state, array_index));
-	access.byte_offset = state.memory_byte_offsets[array_index];
-	access.length      = state.builder.AllocateId();
+	if (state.indirect_buffer.resource == mem.resource) {
+		// A table entry chosen by key: the array index is dynamically uniform (the key is an
+		// SGPR value), so plain dynamic indexing of the descriptor array is enough.
+		state.builder.AddFunction(spv::OpAccessChain, pointer_type, access.object_pointer, variable,
+		                          state.indirect_buffer.array_index);
+		access.byte_offset = state.indirect_buffer.byte_offset;
+	} else {
+		const auto array_index =
+		    ResourceForDescriptor(state, IR::DescriptorBindingKind::Buffers, mem.resource);
+		state.builder.AddFunction(spv::OpAccessChain, pointer_type, access.object_pointer, variable,
+		                          ConstantU32(state, array_index));
+		access.byte_offset = state.memory_byte_offsets[array_index];
+	}
+	access.length = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpArrayLength, TypeU32(state), access.length,
 	                          access.object_pointer, 0);
 	return access;
+}
+
+uint32_t EmitIndirectTableSelection(EmitterState& state, uint32_t key, uint32_t mapping_offset,
+                                    uint32_t search_iterations) {
+	const auto LoadMapping = [&](uint32_t index) {
+		const auto pointer = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(state),
+		                          pointer, state.flattened_srt_variable, ConstantU32(state, 0),
+		                          index);
+		const auto value = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, pointer);
+		return value;
+	};
+	const auto mapping  = ConstantU32(state, mapping_offset);
+	auto       low      = ConstantU32(state, 0u);
+	auto       high     = LoadMapping(mapping);
+	auto       selected = ConstantU32(state, 0u);
+	for (uint32_t iteration = 0; iteration < search_iterations; iteration++) {
+		const auto active = Binary(state, spv::OpULessThan, TypeBool(state), low, high);
+		const auto mid =
+		    Binary(state, spv::OpShiftRightLogical, TypeU32(state),
+		           Binary(state, spv::OpIAdd, TypeU32(state), low, high), ConstantU32(state, 1u));
+		const auto probe = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpSelect, TypeU32(state), probe, active, mid,
+		                          ConstantU32(state, 0u));
+		const auto entry      = Binary(state, spv::OpIAdd, TypeU32(state), mapping,
+		                               Binary(state, spv::OpIAdd, TypeU32(state),
+		                                      Binary(state, spv::OpShiftLeftLogical, TypeU32(state),
+		                                             probe, ConstantU32(state, 1u)),
+		                                      ConstantU32(state, 1u)));
+		const auto mapped_key = LoadMapping(entry);
+		const auto candidate =
+		    LoadMapping(Binary(state, spv::OpIAdd, TypeU32(state), entry, ConstantU32(state, 1u)));
+		const auto equal         = Binary(state, spv::OpIEqual, TypeBool(state), mapped_key, key);
+		const auto match         = Binary(state, spv::OpLogicalAnd, TypeBool(state), active, equal);
+		const auto next_selected = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpSelect, TypeU32(state), next_selected, match, candidate,
+		                          selected);
+		selected              = next_selected;
+		const auto less       = Binary(state, spv::OpULessThan, TypeBool(state), mapped_key, key);
+		const auto take_upper = Binary(state, spv::OpLogicalAnd, TypeBool(state), active, less);
+		const auto take_lower = Binary(state, spv::OpLogicalAnd, TypeBool(state), active,
+		                               Unary(state, spv::OpLogicalNot, TypeBool(state), less));
+		const auto next_low   = state.builder.AllocateId();
+		state.builder.AddFunction(
+		    spv::OpSelect, TypeU32(state), next_low, take_upper,
+		    Binary(state, spv::OpIAdd, TypeU32(state), mid, ConstantU32(state, 1u)), low);
+		low                  = next_low;
+		const auto next_high = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpSelect, TypeU32(state), next_high, take_lower, mid, high);
+		high = next_high;
+	}
+	return selected;
+}
+
+IndirectBufferScope::IndirectBufferScope(ValueEmitContext& ctx, const IR::Inst& inst)
+    : m_state(ctx.state) {
+	m_state.indirect_buffer = {};
+	if (IR::BufferAccessOf(inst.GetOpcode()) == IR::BufferAccess::None || inst.NumArgs() == 0u) {
+		return;
+	}
+	const auto& mem = ctx.Memory(inst);
+	if (mem.planning_only || mem.resource >= m_state.program.info.buffers.size()) {
+		return;
+	}
+	const auto& buffer = m_state.program.info.buffers[mem.resource];
+	if (buffer.indirect_root != mem.resource || buffer.indirect_resources.size() < 2u) {
+		return;
+	}
+	const auto* handle = inst.Arg(0).ResolveInstruction();
+	const auto* source = buffer.source < m_state.program.descriptor_sources.size()
+	                         ? &m_state.program.descriptor_sources[buffer.source]
+	                         : nullptr;
+	if (handle == nullptr || source == nullptr || !source->indirect_table.has_value() ||
+	    source->indirect_table->key_arg >= handle->NumArgs()) {
+		ctx.Fail(inst, "has invalid indirect buffer key provenance");
+	}
+	if (m_state.flattened_srt_variable == 0 || buffer.indirect_search_iterations == 0u) {
+		ctx.Fail(inst, "has no indirect buffer runtime mapping");
+	}
+	const auto key      = ctx.Def(handle->Arg(source->indirect_table->key_arg));
+	const auto selected = EmitIndirectTableSelection(m_state, key, buffer.indirect_mapping_offset,
+	                                                 buffer.indirect_search_iterations);
+	// Resolve the candidate to its dense array slot and byte offset with a select chain; the
+	// tables are small and this keeps the access itself identical to a direct buffer.
+	auto array_index =
+	    ConstantU32(m_state, ResourceForDescriptor(m_state, IR::DescriptorBindingKind::Buffers,
+	                                               buffer.indirect_resources[0]));
+	auto byte_offset = m_state.memory_byte_offsets[ResourceForDescriptor(
+	    m_state, IR::DescriptorBindingKind::Buffers, buffer.indirect_resources[0])];
+	for (uint32_t candidate = 1; candidate < buffer.indirect_resources.size(); candidate++) {
+		const auto slot  = ResourceForDescriptor(m_state, IR::DescriptorBindingKind::Buffers,
+		                                         buffer.indirect_resources[candidate]);
+		const auto match = Binary(m_state, spv::OpIEqual, TypeBool(m_state), selected,
+		                          ConstantU32(m_state, candidate));
+		array_index =
+		    Select(m_state, TypeU32(m_state), match, ConstantU32(m_state, slot), array_index);
+		byte_offset = Select(m_state, TypeU32(m_state), match, m_state.memory_byte_offsets[slot],
+		                     byte_offset);
+	}
+	m_state.indirect_buffer = {
+	    .resource = mem.resource, .array_index = array_index, .byte_offset = byte_offset};
+}
+
+IndirectBufferScope::~IndirectBufferScope() {
+	m_state.indirect_buffer = {};
 }
 
 MemoryResourceAccess PrepareMemoryResourceAccess(EmitterState& state, const IR::MemoryInfo& mem) {
@@ -125,12 +238,11 @@ MemoryResourceAccess PrepareMemoryResourceAccess(EmitterState& state, const IR::
 			return access;
 		case IR::ResourceKind::ScalarAddress:
 		case IR::ResourceKind::Flat:
-		case IR::ResourceKind::Global:
-			EXIT("physical address memory must use the BDA emitter\n");
+		case IR::ResourceKind::Global: EXIT("physical address memory must use the BDA emitter\n");
 		case IR::ResourceKind::ScalarBuffer:
 		case IR::ResourceKind::Buffer: {
-			access = PrepareStorageBufferResourceAccess(
-			    state, mem, state.storage_buffer_variable, TypeStorageBufferPointer(state));
+			access = PrepareStorageBufferResourceAccess(state, mem, state.storage_buffer_variable,
+			                                            TypeStorageBufferPointer(state));
 			access.index_offset = EmitBinaryU32(state, spv::OpShiftRightLogical, access.byte_offset,
 			                                    ConstantU32(state, 2u));
 			access.add_index_offset = true;
@@ -173,9 +285,8 @@ uint32_t EmitMemoryElementPointer(EmitterState& state, const MemoryResourceAcces
 	                                       TypeStorageBufferElementPointer(state));
 }
 
-uint32_t EmitStorageBufferElementPointer(EmitterState& state,
-                                         const MemoryResourceAccess& access, uint32_t index,
-                                         uint32_t pointer_type) {
+uint32_t EmitStorageBufferElementPointer(EmitterState& state, const MemoryResourceAccess& access,
+                                         uint32_t index, uint32_t pointer_type) {
 	const auto pointer = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpAccessChain, pointer_type, pointer, access.object_pointer,
 	                          ConstantU32(state, 0), index);
@@ -210,7 +321,7 @@ uint32_t EmitUFloatToF32Bits(EmitterState& state, uint32_t raw, uint32_t bits) {
 	                                            ConstantU32(state, 23u - mantissa_bits));
 	const auto normal_bits =
 	    EmitBinaryU32(state, spv::OpBitwiseOr, exponent_bits, mantissa_bits_32);
-	const auto normal      = EmitBitcastU32ToF32(state, normal_bits);
+	const auto normal = EmitBitcastU32ToF32(state, normal_bits);
 
 	const auto special_bits =
 	    EmitBinaryU32(state, spv::OpBitwiseOr, ConstantU32(state, 0x7f800000u), mantissa_bits_32);
@@ -296,22 +407,21 @@ uint32_t EmitFloatAtomicReplacement(EmitterState& state, uint32_t old, uint32_t 
 		uint32_t key;
 	};
 	const auto classify = [&](uint32_t bits) {
-		const auto cls = EmitClassifyF32Bits(state, bits);
+		const auto cls      = EmitClassifyF32Bits(state, bits);
 		const auto negative = EmitCompareU32Constant(state, spv::OpINotEqual,
 		                                             EmitAndConstant(state, bits, 0x80000000u), 0u);
 		const auto negative_key = state.builder.AllocateId();
 		state.builder.AddFunction(spv::OpNot, TypeU32(state), negative_key, bits);
 		const auto positive_key =
 		    EmitBinaryU32(state, spv::OpBitwiseXor, bits, ConstantU32(state, 0x80000000u));
-		return OrderedBits {
-		    cls.nan, cls.zero,
-		    EmitSelectValueU32(state, negative, negative_key, positive_key)};
+		return OrderedBits {cls.nan, cls.zero,
+		                    EmitSelectValueU32(state, negative, negative_key, positive_key)};
 	};
 	const auto source_class = classify(source);
 	const auto old_class    = classify(old);
-	const auto unordered = EmitLogicalOrBool(
-	    state, EmitLogicalOrBool(state, source_class.nan, old_class.nan),
-	    EmitLogicalAndBool(state, source_class.zero, old_class.zero));
+	const auto unordered =
+	    EmitLogicalOrBool(state, EmitLogicalOrBool(state, source_class.nan, old_class.nan),
+	                      EmitLogicalAndBool(state, source_class.zero, old_class.zero));
 	const auto compare = state.builder.AllocateId();
 	state.builder.AddFunction(max_value ? spv::OpUGreaterThan : spv::OpULessThan, TypeBool(state),
 	                          compare, source_class.key, old_class.key);

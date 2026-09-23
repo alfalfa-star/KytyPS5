@@ -47,6 +47,12 @@ uint32_t TypeF32(EmitterState& state) {
 	return state.builder.Type(spv::OpTypeFloat, 32);
 }
 
+uint32_t TypeF64(EmitterState& state) {
+	// Unlike U64, which stays a portable uvec2, doubles need the native type and its capability.
+	state.builder.RequireCapability(spv::CapabilityFloat64);
+	return state.builder.Type(spv::OpTypeFloat, 64);
+}
+
 uint32_t TypeU32Vector(EmitterState& state, uint32_t components) {
 	return state.builder.Type(spv::OpTypeVector, TypeU32(state), components);
 }
@@ -484,10 +490,13 @@ void DefineOutputs(EmitterState& state) {
 		DefineMeshOutputs(state);
 		return;
 	}
-	if (state.program.stage == ShaderType::Vertex && clip_distance_count + cull_distance_count < 8u &&
-	    std::ranges::any_of(state.outputs, [](const OutputBinding& output) {
-		    return output.kind == IR::StageOutputKind::Position;
-	    })) {
+	if (state.program.stage == ShaderType::Vertex &&
+	    clip_distance_count + cull_distance_count < 8u &&
+	    std::ranges::any_of(
+	        state.outputs,
+	        [](const OutputBinding& output) {
+		        return output.kind == IR::StageOutputKind::Position;
+	        })) {
 		// Reserve one plane for the enabled PA_CL_CLIP_CNTL clipping-error cull.
 		state.invalid_position_clip_distance = clip_distance_count++;
 		state.outputs.push_back({{IR::StageOutputKind::ClipDistance,
@@ -616,6 +625,9 @@ void DefineModule(EmitterState& state) {
 		state.builder.RequireCapability(spv::CapabilityInt64);
 		state.builder.RequireCapability(spv::CapabilityInt64Atomics);
 	}
+	if (state.requirements.buffer_dynamic_indexing) {
+		state.builder.RequireCapability(spv::CapabilityStorageBufferArrayDynamicIndexing);
+	}
 	if (state.clip_distance_variable != 0) {
 		state.builder.RequireCapability(spv::CapabilityClipDistance);
 	}
@@ -670,12 +682,12 @@ void DefineModule(EmitterState& state) {
 	state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeSignedZeroInfNanPreserve,
 	                               32u);
 	if (const auto* cs = ShaderWorkgroupInput(state.program.stage, state.input_info)) {
-		uint32_t    local_x = state.requirements.compute_derivatives ? 2u : 1u;
-		uint32_t    local_y = state.requirements.compute_derivatives ? 2u : 1u;
-		uint32_t    local_z = 1u;
-		local_x             = cs->threads_num[0] != 0u ? cs->threads_num[0] : local_x;
-		local_y             = cs->threads_num[1] != 0u ? cs->threads_num[1] : local_y;
-		local_z             = cs->threads_num[2] != 0u ? cs->threads_num[2] : local_z;
+		uint32_t local_x = state.requirements.compute_derivatives ? 2u : 1u;
+		uint32_t local_y = state.requirements.compute_derivatives ? 2u : 1u;
+		uint32_t local_z = 1u;
+		local_x          = cs->threads_num[0] != 0u ? cs->threads_num[0] : local_x;
+		local_y          = cs->threads_num[1] != 0u ? cs->threads_num[1] : local_y;
+		local_z          = cs->threads_num[2] != 0u ? cs->threads_num[2] : local_z;
 		if (state.lane_count == 2) {
 			local_x = ((local_x * local_y * local_z + 63u) / 64u) * 32u;
 			local_y = local_z = 1u;

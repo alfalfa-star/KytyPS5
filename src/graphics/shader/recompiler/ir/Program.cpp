@@ -1,6 +1,7 @@
 #include "common/assert.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
+#include <algorithm>
 #include <fmt/format.h>
 #include <map>
 #include <new>
@@ -188,17 +189,118 @@ Value ResolveInvariantPhi(const ResourcePlan& program, Value value) {
 	return invariant;
 }
 
+bool IsMemoryWriteOpcode(ValueOpcode op) {
+	const auto buffer = BufferAccessOf(op);
+	const auto image  = ImageOpcodeInfoOf(op).access;
+	return buffer == BufferAccess::Write || buffer == BufferAccess::Atomic ||
+	       image == ImageAccess::Write || image == ImageAccess::Atomic ||
+	       AddressOpcodeInfoOf(op).access == AddressAccess::Write;
+}
+
+bool IsMemoryReadOpcode(ValueOpcode op) {
+	return BufferAccessOf(op) == BufferAccess::Read ||
+	       ImageOpcodeInfoOf(op).access == ImageAccess::Read ||
+	       AddressOpcodeInfoOf(op).access == AddressAccess::Read;
+}
+
 bool HasShaderMemoryWrites(const Program& program) {
 	for (const auto* block: program.blocks) {
 		for (const auto& inst: *block) {
-			const auto op     = inst.GetOpcode();
-			const auto buffer = BufferAccessOf(op);
-			const auto image  = ImageOpcodeInfoOf(op).access;
-			if (buffer == BufferAccess::Write || buffer == BufferAccess::Atomic ||
-			    image == ImageAccess::Write || image == ImageAccess::Atomic ||
-			    AddressOpcodeInfoOf(op).access == AddressAccess::Write) {
+			if (IsMemoryWriteOpcode(inst.GetOpcode())) {
 				return true;
 			}
+		}
+	}
+	return false;
+}
+
+ShaderWriteOrder::ShaderWriteOrder(const Program& program): m_program(program) {
+	std::vector<const Block*> pending;
+	for (const auto* block: program.blocks) {
+		for (const auto& inst: *block) {
+			if (!IsMemoryWriteOpcode(inst.GetOpcode())) {
+				continue;
+			}
+			if (const auto* handle =
+			        inst.NumArgs() != 0 ? inst.Arg(0).Resolve().TryInstruction() : nullptr;
+			    handle != nullptr &&
+			    std::ranges::find(m_written_handles, handle) == m_written_handles.end()) {
+				m_written_handles.push_back(handle);
+			}
+			if (!m_first_write.contains(block)) {
+				m_first_write.emplace(block, &inst);
+				pending.push_back(block);
+			}
+		}
+	}
+	// Everything at least one edge away from a writing block. The writing block itself only
+	// lands here when a path leads back to it, i.e. the write reaches its own earlier reads on
+	// a later loop visit.
+	while (!pending.empty()) {
+		const auto* block = pending.back();
+		pending.pop_back();
+		for (const auto* successor: block->ImmSuccessors()) {
+			if (m_after_write.insert(successor).second) {
+				pending.push_back(successor);
+			}
+		}
+	}
+}
+
+bool ShaderWriteOrder::WriteMayPrecede(const Inst& read) const {
+	const auto* handle = read.NumArgs() != 0 ? read.Arg(0).Resolve().TryInstruction() : nullptr;
+	if (handle != nullptr && std::ranges::any_of(m_written_handles, [&](const Inst* written) {
+		    return written == handle || EquivalentValue(m_program, Value(handle), Value(written));
+	    })) {
+		return true;
+	}
+	const auto* block = read.Parent();
+	if (block == nullptr || m_after_write.contains(block)) {
+		return true;
+	}
+	const auto first_write = m_first_write.find(block);
+	if (first_write == m_first_write.end()) {
+		return false;
+	}
+	for (const auto& inst: *block) {
+		if (&inst == first_write->second) {
+			return true;
+		}
+		if (&inst == &read) {
+			return false;
+		}
+	}
+	return true;
+}
+
+bool ShaderWriteOrder::WriteMayAffect(Value value) const {
+	if (m_first_write.empty()) {
+		return false;
+	}
+	std::vector<Value>              pending {value};
+	std::unordered_set<const Inst*> visited;
+	while (!pending.empty()) {
+		const auto current = pending.back().Resolve();
+		pending.pop_back();
+		const auto* inst = current.TryInstruction();
+		if (inst == nullptr || !visited.insert(inst).second) {
+			continue;
+		}
+		const auto op = inst->GetOpcode();
+		if (op == ValueOpcode::ReadConst) {
+			// Host placeholder for a planned SRT read; the scalar load it stands in for is still
+			// in its block, so that is where the GPU performs the read.
+			const auto slot = inst->NumArgs() == 2 ? inst->Arg(1).Resolve() : Value {};
+			if (!slot.IsImmediate() || slot.GetType() != Type::U32 ||
+			    slot.U32() >= m_program.srt_reads.size()) {
+				return true;
+			}
+			pending.push_back(m_program.srt_reads[slot.U32()].value);
+		} else if (IsMemoryReadOpcode(op) && WriteMayPrecede(*inst)) {
+			return true;
+		}
+		for (size_t index = 0; index < inst->NumArgs(); index++) {
+			pending.push_back(inst->Arg(index));
 		}
 	}
 	return false;

@@ -18,6 +18,8 @@
 #include <memory>
 #include <optional>
 #include <string_view>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
@@ -61,11 +63,14 @@ struct MemoryInfo {
 	bool                    data_signed              = false;
 	bool                    typed                    = false;
 	bool                    formatted                = false;
-	bool                    image_has_mip            = false;
-	bool                    image_r128               = false;
-	bool                    idxen                    = false;
-	bool                    offen                    = false;
-	bool                    planning_only            = false;
+	// A formatted buffer access whose components travel as 16-bit values (f16 for float
+	// formats, the low bits for integer ones) instead of full 32-bit dwords.
+	bool d16           = false;
+	bool image_has_mip = false;
+	bool image_r128    = false;
+	bool idxen         = false;
+	bool offen         = false;
+	bool planning_only = false;
 
 	bool operator==(const MemoryInfo& other) const = default;
 };
@@ -85,7 +90,8 @@ struct ExportInfo {
 };
 
 struct BufferResource {
-	static constexpr uint32_t NoImageAlias = UINT32_MAX;
+	static constexpr uint32_t NoImageAlias     = UINT32_MAX;
+	static constexpr uint32_t NoIndirectBuffer = UINT32_MAX;
 
 	uint32_t               source             = 0;
 	uint32_t               first_use_pc       = 0;
@@ -99,6 +105,13 @@ struct BufferResource {
 	bool                   atomic             = false;
 	bool                   formatted          = false;
 	bool                   scalar             = false;
+	// A V# the shader picks out of a descriptor table with a runtime key (see
+	// DescriptorSource::IndirectTable) is specialized like an indirect image: the root keeps the
+	// key mapping and every table entry the host enumerated becomes its own dense buffer.
+	uint32_t              indirect_root              = NoIndirectBuffer;
+	uint32_t              indirect_mapping_offset    = 0;
+	uint32_t              indirect_search_iterations = 0;
+	std::vector<uint32_t> indirect_resources;
 
 	bool operator==(const BufferResource& other) const = default;
 };
@@ -423,8 +436,8 @@ struct BindingLayout {
 };
 
 struct ShaderInfo {
-	static constexpr uint32_t MaxBuffers      = 32;
-	static constexpr uint32_t MaxImages       = 64;
+	static constexpr uint32_t MaxBuffers      = 1024;
+	static constexpr uint32_t MaxImages       = 1024;
 	static constexpr uint32_t MaxSamplers     = 32;
 	static constexpr uint32_t MaxSampledPairs = 64;
 
@@ -453,7 +466,10 @@ struct BlockInfo {
 };
 
 struct DescriptorSource {
-	struct IndirectImage {
+	// A descriptor the shader fetches from a table of T#s (entry_dwords 8) or V#s (entry_dwords 4)
+	// with a key it only knows at runtime. The host enumerates the entries the key can select when
+	// the shader is bound and the emitted code picks among them by key.
+	struct IndirectTable {
 		uint32_t material_source = 0;
 		uint32_t heap_source     = 0;
 		uint32_t selector_stride = 0;
@@ -462,13 +478,41 @@ struct DescriptorSource {
 		// Fixed byte offset of the key field within one material record, for materials that
 		// store their bindless heap index somewhere other than the record's first dword.
 		uint32_t material_offset = 0;
+		// Nonzero when the key is a value the shader computes with a provably small range
+		// (e.g. the bit index of a wave-reduced mask driving a waterfall loop) rather than a
+		// material-record read: the candidates are then heap entries [0, key_count) and
+		// material_source is unused. The heap is a 4-dword V# or a 2-dword raw address.
+		uint32_t key_count = 0;
+		// Immediate byte offset of the descriptor table within the heap, added to
+		// key * entry_stride.
+		uint32_t heap_offset  = 0;
+		uint32_t entry_dwords = 8;
+		// Byte distance between consecutive table entries: the descriptor's own size for a
+		// packed table, larger when the descriptor heads a bigger per-entry record.
+		uint32_t entry_stride = 32;
+		// A loop counter key is bounded by the loop's exit comparison rather than by its shape:
+		// this host-evaluable value caps the enumerated keys below key_count.
+		Value key_bound;
+		// The key is arbitrary shader data, but the heap is a V# read with S_BUFFER_LOAD, which
+		// returns zero past NumRecords: only keys whose entry lies inside the heap can reach a
+		// descriptor, so the heap's own size bounds the enumeration.
+		bool heap_bounded = false;
+		// The table entry is not in the heap itself: the heap record holds a 64-bit address at
+		// pointer_offset, and the descriptor sits heap_offset bytes past that address.
+		bool     via_pointer    = false;
+		uint32_t pointer_offset = 0;
+		// An S# table: the host collapses it to one sampler, since samplers bind statically.
+		bool sampler = false;
+		// A descriptor waterfall over a per-lane choice among fixed descriptors: the candidates
+		// are these runtime-evaluable sources and the key is the index of the chosen one.
+		std::vector<uint32_t> candidate_sources;
 
-		bool operator==(const IndirectImage& other) const = default;
+		bool operator==(const IndirectTable& other) const = default;
 	};
 
 	std::array<Value, 8>         dwords {};
 	uint32_t                     dword_count = 0;
-	std::optional<IndirectImage> indirect_image;
+	std::optional<IndirectTable> indirect_table;
 
 	bool operator==(const DescriptorSource& other) const = default;
 };
@@ -562,7 +606,32 @@ struct Program: ResourcePlan {
 };
 
 std::string ProgramToString(const Program& program);
+bool        IsMemoryWriteOpcode(ValueOpcode op);
+bool        IsMemoryReadOpcode(ValueOpcode op);
 bool        HasShaderMemoryWrites(const Program& program);
+
+// The host evaluates uniform values (branch predicates, descriptor dwords) from memory as it is
+// when the shader is bound, so a value is only trustworthy when no write in this shader can
+// execute before a memory read it depends on. Program order here is same-block-earlier or any
+// block reachable from a writing block, which covers loop back-edges and barrier-ordered
+// cross-invocation writes alike; a write through the same descriptor the read uses counts in
+// any order, since other waves run the store concurrently.
+class ShaderWriteOrder {
+public:
+	explicit ShaderWriteOrder(const Program& program);
+
+	[[nodiscard]] bool HasWrites() const { return !m_first_write.empty(); }
+	[[nodiscard]] bool WriteMayPrecede(const Inst& read) const;
+	[[nodiscard]] bool WriteMayAffect(Value value) const;
+
+private:
+	const Program&                                m_program;
+	std::unordered_map<const Block*, const Inst*> m_first_write;
+	std::unordered_set<const Block*>              m_after_write;
+	// Descriptor handles any write goes through: a read of the same resource is stale as soon
+	// as another wave stores to it, whatever this wave's program order says.
+	std::vector<const Inst*> m_written_handles;
+};
 
 void  ValidateProgram(const Program& program, bool require_ssa);
 void  ResolveControlFlowIdentities(Program& program);

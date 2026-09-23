@@ -76,11 +76,10 @@ void AllocateBindings(Program& program, uint32_t push_data_start_dword) {
 		                                             : "binding layout already allocated");
 	}
 	BindingLayout next;
-	next.user_data_registers = CollectUserData(program);
-	next.memory_offset_dword = static_cast<uint32_t>(next.user_data_registers.size());
-	next.memory_offset_count = static_cast<uint32_t>(program.info.buffers.size());
-	next.push_data_start_dword =
-	    PushData::StartFor(push_data_start_dword, next.ShaderDataDwords());
+	next.user_data_registers   = CollectUserData(program);
+	next.memory_offset_dword   = static_cast<uint32_t>(next.user_data_registers.size());
+	next.memory_offset_count   = static_cast<uint32_t>(program.info.buffers.size());
+	next.push_data_start_dword = PushData::StartFor(push_data_start_dword, next.ShaderDataDwords());
 
 	if (!program.info.buffers.empty()) {
 		std::vector<uint32_t> resources(program.info.buffers.size());
@@ -132,8 +131,11 @@ void AllocateBindings(Program& program, uint32_t push_data_start_dword) {
 	}
 	const bool uses_flattened_runtime =
 	    !program.srt_reads.empty() ||
-	    std::ranges::any_of(program.info.images, [](const ImageResource& image) {
-		    return image.indirect_search_iterations != 0u;
+	    std::ranges::any_of(
+	        program.info.images,
+	        [](const ImageResource& image) { return image.indirect_search_iterations != 0u; }) ||
+	    std::ranges::any_of(program.info.buffers, [](const BufferResource& buffer) {
+		    return buffer.indirect_search_iterations != 0u;
 	    });
 	if (uses_flattened_runtime) {
 		AddBinding(next, DescriptorBindingKind::FlattenedSrt);

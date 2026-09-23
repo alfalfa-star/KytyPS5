@@ -53,7 +53,7 @@ void BufferCache::Unregister(BufferId id) {
 
 template <bool insert>
 void BufferCache::ChangeRegister(BufferId id) {
-	auto& buffer = m_slot_buffers[id];
+	auto&                buffer = m_slot_buffers[id];
 	PageTable::PageRange pages {};
 	EXIT_IF(!PageTable::TryGetPageRange(buffer.CpuAddress(), buffer.Size(), pages));
 	for (size_t page = pages.first; page < pages.last_exclusive; ++page) {
@@ -247,7 +247,8 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		const auto         buffer_begin = buffer.CpuAddress();
 		const auto         buffer_end   = buffer_begin + buffer.Size();
 		const auto window_begin = std::max(Common::AlignDown(vaddr, WindowSize), buffer_begin);
-		const auto window_end = std::min(std::max(window_begin + WindowSize, vaddr + size), buffer_end);
+		const auto window_end =
+		    std::min(std::max(window_begin + WindowSize, vaddr + size), buffer_end);
 
 		if (DownloadBufferMemory(buffer, window_begin, window_end - window_begin)) {
 			const auto tick = m_scheduler.CurrentTick();
@@ -310,7 +311,8 @@ BufferCache::OverlapResult BufferCache::ResolveOverlaps(uint64_t vaddr, uint64_t
 		if (!has_stream_leap && (stream_score += buffer.StreamScore()) > StreamLeapThreshold) {
 			has_stream_leap = true;
 			// Reserve space in the incoming stream's direction of growth.
-			// The old buffer extending left of the request predicts growth to the right, and vice versa.
+			// The old buffer extending left of the request predicts growth to the right, and vice
+			// versa.
 			if (expands_left) {
 				end += std::min(StreamLeapSize, PageTable::kAddressSpaceSize - end);
 			}
@@ -340,8 +342,8 @@ void BufferCache::JoinOverlap(BufferId new_id, BufferId overlap_id, bool accumul
 
 BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 	EXIT_IF(m_scheduler.Current().IsInvalid());
-	const auto end = Common::AlignUp(vaddr + size, CACHING_PAGESIZE);
-	vaddr = Common::AlignDown(vaddr, CACHING_PAGESIZE);
+	const auto end     = Common::AlignUp(vaddr + size, CACHING_PAGESIZE);
+	vaddr              = Common::AlignDown(vaddr, CACHING_PAGESIZE);
 	size               = end - vaddr;
 	const auto overlap = ResolveOverlaps(vaddr, size);
 
@@ -375,28 +377,28 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 	if (source) {
 		auto& command = m_scheduler.Current();
 		command.EndRendering();
-		const auto native = command.Handle();
+		const auto              native = command.Handle();
 		vk::BufferMemoryBarrier before {};
 		before.srcAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite |
 		                       vk::AccessFlagBits::eTransferRead |
 		                       vk::AccessFlagBits::eTransferWrite;
-		before.dstAccessMask       = vk::AccessFlagBits::eTransferWrite;
+		before.dstAccessMask = vk::AccessFlagBits::eTransferWrite;
 		before.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
 		before.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
 		before.buffer              = buffer.Handle();
 		before.offset              = 0;
 		before.size                = buffer.Size();
-		native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
-		                       vk::PipelineStageFlagBits::eTransfer,
-		                       vk::DependencyFlagBits::eByRegion, 0, nullptr, 1, &before, 0, nullptr);
+		native.pipelineBarrier(
+		    vk::PipelineStageFlagBits::eAllCommands, vk::PipelineStageFlagBits::eTransfer,
+		    vk::DependencyFlagBits::eByRegion, 0, nullptr, 1, &before, 0, nullptr);
 		native.copyBuffer(source, buffer.Handle(), static_cast<uint32_t>(copies.size()),
 		                  copies.data());
 		auto after          = before;
 		after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
 		after.dstAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
-		native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
-		                       vk::PipelineStageFlagBits::eAllCommands,
-		                       vk::DependencyFlagBits::eByRegion, 0, nullptr, 1, &after, 0, nullptr);
+		native.pipelineBarrier(
+		    vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eAllCommands,
+		    vk::DependencyFlagBits::eByRegion, 0, nullptr, 1, &after, 0, nullptr);
 	}
 	if (is_texel_buffer && !is_written) {
 		return SynchronizeBufferFromImage(buffer, vaddr, size);
@@ -422,7 +424,7 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 	}
 
 	auto temporary = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::Upload, 0,
-	                                         vk::BufferUsageFlagBits::eTransferSrc, total_size);
+	                                          vk::BufferUsageFlagBits::eTransferSrc, total_size);
 	for (const auto& copy: copies) {
 		const auto address = buffer.CpuAddress() + copy.dstOffset;
 		std::memcpy(temporary->Mapped().data() + copy.srcOffset,
@@ -484,9 +486,29 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, u
 	}
 
 	auto [staging, stage_offset] = m_staging_buffer.Map(size, 16);
-	if (staging == nullptr || (!Libs::LibKernel::Memory::TryReadBacking(vaddr, staging, size) &&
-	                           !Libs::LibKernel::Memory::TryReadPrtBacking(vaddr, staging, size))) {
-		EXIT("BufferCache: failed to read mapped guest image backing\n");
+	// A partially resident texture (the game maps its pages individually, e.g. for streaming)
+	// has holes; like unbacked PRT pages those read as zero.
+	const auto read_sparse = [&]() {
+		constexpr uint64_t kPage   = 0x1000u;
+		bool               any_hit = false;
+		for (uint64_t offset = 0; offset < size;) {
+			const auto chunk = std::min(kPage - ((vaddr + offset) & (kPage - 1u)), size - offset);
+			auto*      dst   = static_cast<uint8_t*>(staging) + offset;
+			if (Libs::LibKernel::Memory::TryReadBacking(vaddr + offset, dst, chunk)) {
+				any_hit = true;
+			} else {
+				std::memset(dst, 0, chunk);
+			}
+			offset += chunk;
+		}
+		return any_hit;
+	};
+	if (staging == nullptr ||
+	    (!Libs::LibKernel::Memory::TryReadBacking(vaddr, staging, size) &&
+	     !Libs::LibKernel::Memory::TryReadPrtBacking(vaddr, staging, size) && !read_sparse())) {
+		EXIT("BufferCache: failed to read mapped guest image backing: addr=0x%016" PRIx64
+		     " size=0x%" PRIx64 "\n",
+		     vaddr, size);
 	}
 	m_staging_buffer.Commit();
 	return {&m_staging_buffer, stage_offset};
@@ -533,7 +555,8 @@ void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t si
 		     src_vaddr, dst_vaddr, size, static_cast<int>(src_gds), static_cast<int>(dst_gds));
 	}
 	if (src_memory && dst_memory && !IsRegionGpuModified(dst_vaddr, size) &&
-	    !IsRegionGpuModified(src_vaddr, size) && !m_texture_cache.FindImageFromRange(src_vaddr, size)) {
+	    !IsRegionGpuModified(src_vaddr, size) &&
+	    !m_texture_cache.FindImageFromRange(src_vaddr, size)) {
 		std::memcpy(reinterpret_cast<void*>(dst_vaddr), reinterpret_cast<const void*>(src_vaddr),
 		            size);
 		return;

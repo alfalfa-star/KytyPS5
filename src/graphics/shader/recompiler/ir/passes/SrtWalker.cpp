@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <bit>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <fmt/format.h>
 #include <unordered_map>
@@ -330,9 +331,8 @@ public:
 						                        (op == ValueOpcode::ReadConstBuffer &&
 						                         kind == ResourceKind::ScalarAddress);
 						if (crosswired) {
-							Fail(flags.pc,
-							     fmt::format("{} has incompatible scalar memory metadata",
-							                 ValueOpcodeName(op)));
+							Fail(flags.pc, fmt::format("{} has incompatible scalar memory metadata",
+							                           ValueOpcodeName(op)));
 						}
 					}
 				}
@@ -366,6 +366,23 @@ private:
 		const auto diagnostic = Diagnostic(m_program, pc, message);
 		EXIT("shader SRT planning failed: %s", diagnostic.c_str());
 		std::abort();
+	}
+
+	bool DependsOnDynamicRead(Value value, uint32_t depth) const {
+		value = value.Resolve();
+		if (std::ranges::find(m_program.dynamic_reads, value) != m_program.dynamic_reads.end()) {
+			return true;
+		}
+		const auto* inst = value.TryInstruction();
+		if (inst == nullptr || depth > 16u || inst->GetOpcode() == ValueOpcode::Phi) {
+			return false;
+		}
+		for (size_t index = 0; index < inst->NumArgs(); index++) {
+			if (DependsOnDynamicRead(inst->Arg(index), depth + 1u)) {
+				return true;
+			}
+		}
+		return false;
 	}
 
 	void Collect(Value value, uint32_t use_pc) {
@@ -406,6 +423,11 @@ private:
 			    m_program.dynamic_reads.end()) {
 				m_program.dynamic_reads.push_back(value);
 			}
+			return;
+		}
+		// A fixed offset from a base the host cannot compute (a pointer fetched at a per-lane
+		// key) is not an SRT slot: leave the read in the shader for descriptor-table matching.
+		if (DependsOnDynamicRead(inst->Arg(0), 0) && !ValidateRuntimeValue(m_program, value)) {
 			return;
 		}
 		for (uint32_t slot = 0; slot < m_program.srt_reads.size(); slot++) {
@@ -513,7 +535,7 @@ private:
 			return false;
 		}
 		m_visiting.push_back(inst);
-		uint64_t out = 0;
+		uint64_t   out       = 0;
 		const bool evaluated = EvaluateInst(*inst, out);
 		m_visiting.pop_back();
 		if (!evaluated) {
@@ -608,7 +630,9 @@ private:
 			                      ? static_cast<uint64_t>(static_cast<uint32_t>(records))
 			                      : static_cast<uint64_t>(stride) * static_cast<uint32_t>(records);
 			if (aligned > size || size - aligned < sizeof(uint32_t)) {
-				return false;
+				// S_BUFFER_LOAD past NumRecords returns zero.
+				result = 0;
+				return true;
 			}
 			address = ((base & ~uint64_t {3}) + byte_offset) & ~uint64_t {3};
 		} else {
@@ -1041,6 +1065,13 @@ bool EvaluateRuntimeSourcesImpl(const ResourcePlan& program, std::span<const uin
 		if (!evaluate_flat || active[source_index]) {
 			for (uint32_t index = 0; index < source->dword_count; index++) {
 				if (!evaluator.Evaluate(source->dwords[index], value.dwords[index])) {
+					// DIAG
+					const auto* diag_inst = source->dwords[index].Resolve().TryInstruction();
+					std::fprintf(stderr, "DIAG srt eval failed: source=%u dword=%u op=%s\n",
+					             source_index, index,
+					             diag_inst != nullptr
+					                 ? std::string(ValueOpcodeName(diag_inst->GetOpcode())).c_str()
+					                 : "imm");
 					return false;
 				}
 			}
@@ -1056,11 +1087,18 @@ bool EvaluateRuntimeSourcesImpl(const ResourcePlan& program, std::span<const uin
 			auto&      selected = clean ? clean_evaluator : evaluator;
 			if (read.flat_offset >= flattened.size() ||
 			    !selected.Evaluate(read.value, flattened[read.flat_offset])) {
+				// DIAG
+				const auto* diag_inst = read.value.Resolve().TryInstruction();
+				std::fprintf(stderr, "DIAG srt flat eval failed: slot=%u clean=%d op=%s\n",
+				             read.flat_offset, clean,
+				             diag_inst != nullptr
+				                 ? std::string(ValueOpcodeName(diag_inst->GetOpcode())).c_str()
+				                 : "imm");
 				return false;
 			}
 		}
 	}
-	results = std::move(evaluated);
+	results        = std::move(evaluated);
 	active_sources = std::move(active);
 	if (evaluate_flat) {
 		flat = std::move(flattened);
@@ -1084,7 +1122,7 @@ void BuildSrtPlan(Program& program) {
 }
 
 bool EvaluateUniformValues(const ResourcePlan& program, std::span<const Value> values,
-                            const SrtRuntime& runtime, std::span<uint32_t> results) {
+                           const SrtRuntime& runtime, std::span<uint32_t> results) {
 	if (values.size() != results.size()) {
 		return false;
 	}

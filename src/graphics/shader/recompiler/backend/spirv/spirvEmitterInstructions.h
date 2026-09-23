@@ -128,12 +128,22 @@ uint32_t EmitFPMinTri32(EmitterState& state, uint32_t arg0, uint32_t arg1, uint3
 uint32_t EmitFPMaxTri32(EmitterState& state, uint32_t arg0, uint32_t arg1, uint32_t arg2);
 uint32_t EmitFPMedTri32(EmitterState& state, uint32_t arg0, uint32_t arg1, uint32_t arg2);
 uint32_t EmitFPRecip32(EmitterState& state, uint32_t arg0);
-uint32_t EmitFPRecipIFlag32(EmitterState& state, uint32_t arg0);
-uint32_t EmitFPRecipSqrt32(EmitterState& state, uint32_t arg0);
-uint32_t EmitFPSqrt(EmitterState& state, uint32_t arg0);
-uint32_t EmitFPExp2(EmitterState& state, uint32_t arg0);
-uint32_t EmitFPLog2(EmitterState& state, uint32_t arg0);
-uint32_t EmitFPLdexp(EmitterState& state, uint32_t arg0, uint32_t arg1);
+EMIT_NATIVE(BitCastF64U64, OpBitcast, F64, uint32_t)
+EMIT_NATIVE(BitCastU64F64, OpBitcast, U64, uint32_t)
+uint32_t EmitConvertF64S32(EmitterState& state, uint32_t arg0);
+EMIT_NATIVE(ConvertF32F64, OpFConvert, F32, uint32_t)
+inline constexpr auto EmitFPAbs64 = EmitGlsl<GLSLstd450FAbs, IR::Type::F64, uint32_t>;
+EMIT_NATIVE(FPNeg64, OpFNegate, F64, uint32_t)
+EMIT_NATIVE(FPMul64, OpFMul, F64, uint32_t, uint32_t)
+inline constexpr auto EmitFPFma64 =
+    EmitGlsl<GLSLstd450Fma, IR::Type::F64, uint32_t, uint32_t, uint32_t>;
+uint32_t              EmitFPRecip64(EmitterState& state, uint32_t arg0);
+uint32_t              EmitFPRecipIFlag32(EmitterState& state, uint32_t arg0);
+uint32_t              EmitFPRecipSqrt32(EmitterState& state, uint32_t arg0);
+uint32_t              EmitFPSqrt(EmitterState& state, uint32_t arg0);
+uint32_t              EmitFPExp2(EmitterState& state, uint32_t arg0);
+uint32_t              EmitFPLog2(EmitterState& state, uint32_t arg0);
+uint32_t              EmitFPLdexp(EmitterState& state, uint32_t arg0, uint32_t arg1);
 inline constexpr auto EmitFPRoundEven32 = EmitGlsl<GLSLstd450RoundEven, IR::Type::F32, uint32_t>;
 inline constexpr auto EmitFPFloor32     = EmitGlsl<GLSLstd450Floor, IR::Type::F32, uint32_t>;
 inline constexpr auto EmitFPCeil32      = EmitGlsl<GLSLstd450Ceil, IR::Type::F32, uint32_t>;
@@ -271,6 +281,8 @@ inline constexpr auto EmitImageAtomicUMax32    = EmitImage;
 inline constexpr auto EmitImageAtomicAnd32     = EmitImage;
 inline constexpr auto EmitImageAtomicOr32      = EmitImage;
 inline constexpr auto EmitImageAtomicXor32     = EmitImage;
+inline constexpr auto EmitImageAtomicFMin32    = EmitImage;
+inline constexpr auto EmitImageAtomicFMax32    = EmitImage;
 void                  EmitUnreachable(ValueEmitContext& ctx, const IR::Inst& inst);
 inline constexpr auto EmitPhi                        = EmitUnreachable;
 inline constexpr auto EmitTessellationBase           = EmitUnreachable;

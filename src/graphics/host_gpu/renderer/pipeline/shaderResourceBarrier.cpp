@@ -4,6 +4,7 @@
 #include "graphics/shader/shader.h"
 #include "graphics/shader/shaderBindings.h"
 
+#include <algorithm>
 #include <cstring>
 
 namespace Libs::Graphics {
@@ -49,12 +50,9 @@ vk::PipelineStageFlags ShaderPipelineStages(vk::ShaderStageFlags stages) {
 vk::MemoryBarrier MakeShaderWriteDependency() {
 	vk::MemoryBarrier barrier {};
 	barrier.srcAccessMask = vk::AccessFlagBits::eShaderWrite;
-	barrier.dstAccessMask = vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite |
-	                        vk::AccessFlagBits::eVertexAttributeRead |
-	                        vk::AccessFlagBits::eIndexRead | vk::AccessFlagBits::eUniformRead |
-	                        vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite |
-	                        vk::AccessFlagBits::eColorAttachmentRead |
-	                        vk::AccessFlagBits::eColorAttachmentWrite;
+	// Every later consumer, including indirect draw/dispatch arguments and depth attachments a
+	// shader-written buffer or image may feed.
+	barrier.dstAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
 	return barrier;
 }
 
@@ -92,7 +90,11 @@ bool HasShaderBufferWrites(const ShaderStageRuntime& runtime) {
 	const auto& program   = *runtime.program;
 	const auto& resources = runtime.resources;
 	EXIT_IF(resources.buffers.size() != program.info.buffers.size());
-	bool has_writes = false;
+	// Storage image stores need the same ordering against later readers as buffer stores.
+	bool has_writes = std::ranges::any_of(program.info.images, [](const auto& image) {
+		return image.written &&
+		       image.resource_class == ShaderRecompiler::IR::ImageResourceClass::Storage;
+	});
 	for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
 		if (!program.info.buffers[i].written) {
 			continue;
