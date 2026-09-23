@@ -9,8 +9,9 @@
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv {
 
-std::vector<uint32_t> EmitProgram(const IR::Program& program,
-                                  ShaderStageInputInfo input_info);
+// maximal_reconvergence requires VK_KHR_shader_maximal_reconvergence on the host device.
+std::vector<uint32_t> EmitProgram(const IR::Program& program, ShaderStageInputInfo input_info,
+                                  bool maximal_reconvergence = false);
 
 } // namespace Libs::Graphics::ShaderRecompiler::Spirv
 

@@ -88,6 +88,7 @@ struct EmitterState {
 	const SpirvRequirements                          requirements;
 	uint32_t                                         lane_count                  = 1;
 	uint32_t                                         lane_half                   = 0;
+	bool                                             maximal_reconvergence       = false;
 	uint32_t                                         storage_buffer_variable     = 0;
 	uint32_t                                         storage_buffer_u64_variable = 0;
 	std::array<uint32_t, IR::ShaderInfo::MaxBuffers> memory_byte_offsets {};

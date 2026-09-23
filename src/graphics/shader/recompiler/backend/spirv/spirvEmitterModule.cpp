@@ -681,6 +681,14 @@ void DefineModule(EmitterState& state) {
 	// contract prevents host compilers from treating synthesized IEEE values as finite.
 	state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeSignedZeroInfNanPreserve,
 	                               32u);
+	if (state.maximal_reconvergence) {
+		// A guest wave runs its lanes in lockstep: lanes that leave a divergent region rejoin
+		// before the next instruction. Without this, a host loop header need not reconverge,
+		// and a readlane/ballot waterfall can read an invocation that is not currently active
+		// and spin forever.
+		state.builder.RequireExtension("SPV_KHR_maximal_reconvergence");
+		state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeMaximallyReconvergesKHR);
+	}
 	if (const auto* cs = ShaderWorkgroupInput(state.program.stage, state.input_info)) {
 		uint32_t local_x = state.requirements.compute_derivatives ? 2u : 1u;
 		uint32_t local_y = state.requirements.compute_derivatives ? 2u : 1u;

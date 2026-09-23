@@ -567,6 +567,15 @@ static vk::Device VulkanCreateDevice(GraphicContext&                 graphics,
 		provoking_vertex.pNext    = supported_features2.pNext;
 		supported_features2.pNext = &provoking_vertex;
 	}
+	const bool reconvergence_extensions =
+	    HasExtension(device_extensions, VK_KHR_SHADER_MAXIMAL_RECONVERGENCE_EXTENSION_NAME);
+	vk::PhysicalDeviceShaderSubgroupUniformControlFlowFeaturesKHR uniform_control_flow {};
+	vk::PhysicalDeviceShaderMaximalReconvergenceFeaturesKHR       maximal_reconvergence {};
+	if (reconvergence_extensions) {
+		uniform_control_flow.pNext  = supported_features2.pNext;
+		maximal_reconvergence.pNext = &uniform_control_flow;
+		supported_features2.pNext   = &maximal_reconvergence;
+	}
 	physical_device.getFeatures2(&supported_features2);
 	graphics.mesh_shader_enabled = mesh_extension && supported_mesh.meshShader;
 
@@ -604,6 +613,11 @@ static vk::Device VulkanCreateDevice(GraphicContext&                 graphics,
 	                                            feedback_dynamic.attachmentFeedbackLoopDynamicState;
 	LOGF("Vulkan depth feedback support: %s\n",
 	     graphics.attachment_feedback_loop_enabled ? "true" : "false");
+	graphics.maximal_reconvergence_enabled =
+	    reconvergence_extensions && uniform_control_flow.shaderSubgroupUniformControlFlow &&
+	    maximal_reconvergence.shaderMaximalReconvergence;
+	LOGF("Vulkan maximal reconvergence: %s\n",
+	     graphics.maximal_reconvergence_enabled ? "true" : "false");
 	if (graphics.mesh_shader_enabled) {
 		LOGF("Vulkan MeshEXT: invocations=%u vertices=%u primitives=%u shared=%u\n",
 		     graphics.mesh_shader_properties.maxMeshWorkGroupInvocations,
@@ -694,6 +708,15 @@ static vk::Device VulkanCreateDevice(GraphicContext&                 graphics,
 		provoking_vertex.pNext = const_cast<void*>(create_info.pNext);
 		provoking_vertex.transformFeedbackPreservesProvokingVertex = VK_FALSE;
 		create_info.pNext                                          = &provoking_vertex;
+	}
+	vk::PhysicalDeviceShaderSubgroupUniformControlFlowFeaturesKHR enable_uniform_control_flow {};
+	vk::PhysicalDeviceShaderMaximalReconvergenceFeaturesKHR       enable_maximal_reconvergence {};
+	if (graphics.maximal_reconvergence_enabled) {
+		enable_uniform_control_flow.pNext = const_cast<void*>(create_info.pNext);
+		enable_uniform_control_flow.shaderSubgroupUniformControlFlow = VK_TRUE;
+		enable_maximal_reconvergence.pNext                           = &enable_uniform_control_flow;
+		enable_maximal_reconvergence.shaderMaximalReconvergence      = VK_TRUE;
+		create_info.pNext = &enable_maximal_reconvergence;
 	}
 	create_info.pQueueCreateInfos       = &queue_create_info;
 	create_info.queueCreateInfoCount    = 1;
@@ -1082,6 +1105,14 @@ void WindowContext::CreateVulkan() {
 			device_extensions.push_back(VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME);
 			device_extensions.push_back(
 			    VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME);
+		}
+		// Maximal reconvergence depends on subgroup uniform control flow.
+		if (HasExtension(available_extensions,
+		                 VK_KHR_SHADER_SUBGROUP_UNIFORM_CONTROL_FLOW_EXTENSION_NAME) &&
+		    HasExtension(available_extensions,
+		                 VK_KHR_SHADER_MAXIMAL_RECONVERGENCE_EXTENSION_NAME)) {
+			device_extensions.push_back(VK_KHR_SHADER_SUBGROUP_UNIFORM_CONTROL_FLOW_EXTENSION_NAME);
+			device_extensions.push_back(VK_KHR_SHADER_MAXIMAL_RECONVERGENCE_EXTENSION_NAME);
 		}
 	}
 
