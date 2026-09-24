@@ -913,17 +913,30 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, Materialize
 		        next_snapshot.flattened_srt.size()) {
 			return SpecializationFail("indirect image specialization has an invalid key mapping");
 		}
-		uint32_t exemplar       = ImageResource::NoIndirectImage;
-		uint32_t resource_count = 0;
+		// Prefer an entry of the dimension the sampling instruction was encoded for: a table
+		// enumerated over every material record also holds entries this shader never selects.
+		const auto requested      = program.info.images[root_index].dimension;
+		uint32_t   exemplar       = ImageResource::NoIndirectImage;
+		uint32_t   matching       = ImageResource::NoIndirectImage;
+		uint32_t   resource_count = 0;
 		for (uint32_t resource = 0; resource < next_specialization.images.size(); resource++) {
 			if (next_specialization.images[resource].indirect_root != root_index) {
 				continue;
 			}
 			resource_count++;
-			if (exemplar == ImageResource::NoIndirectImage &&
-			    !NullImageDescriptor(next_snapshot.images[resource])) {
+			if (NullImageDescriptor(next_snapshot.images[resource])) {
+				continue;
+			}
+			if (exemplar == ImageResource::NoIndirectImage) {
 				exemplar = resource;
 			}
+			if (matching == ImageResource::NoIndirectImage &&
+			    next_specialization.images[resource].dimension == requested) {
+				matching = resource;
+			}
+		}
+		if (matching != ImageResource::NoIndirectImage) {
+			exemplar = matching;
 		}
 		if (resource_count < 2u || exemplar == ImageResource::NoIndirectImage) {
 			return SpecializationFail("indirect image specialization has no typed candidate");
@@ -990,18 +1003,29 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, Materialize
 			    image.conversion_format != image_class.conversion_format ||
 			    image.shader_swizzle != image_class.shader_swizzle ||
 			    image.cube != image_class.cube) {
-				return SpecializationFail(fmt::format(
-				    "indirect image table at pc 0x{:08x} has incompatible candidates: "
-				    "numeric {}/{} dimension {}/{} mips {}/{} conversion {}/{} swizzle "
-				    "0x{:x}/0x{:x} cube {}/{}",
-				    program.info.images[root_index].first_use_pc,
-				    static_cast<uint32_t>(image.numeric_class),
-				    static_cast<uint32_t>(image_class.numeric_class),
-				    static_cast<uint32_t>(image.dimension),
-				    static_cast<uint32_t>(image_class.dimension), image.mip_count,
-				    image_class.mip_count, static_cast<uint32_t>(image.conversion_format),
-				    static_cast<uint32_t>(image_class.conversion_format), image.shader_swizzle,
-				    image_class.shader_swizzle, image.cube, image_class.cube));
+				// One sampling sequence serves the whole table, and the table may hold entries
+				// this shader never selects (other materials' textures): bind such an entry as
+				// null rather than failing the draw, like an incompatible buffer candidate.
+				std::fprintf(stderr,
+				             "shader resource specialization: indirect image table at pc 0x%08x "
+				             "drops an incompatible candidate (numeric %u/%u dimension %u/%u mips "
+				             "%u/%u conversion %u/%u swizzle 0x%x/0x%x cube %d/%d)\n",
+				             program.info.images[root_index].first_use_pc,
+				             static_cast<uint32_t>(image.numeric_class),
+				             static_cast<uint32_t>(image_class.numeric_class),
+				             static_cast<uint32_t>(image.dimension),
+				             static_cast<uint32_t>(image_class.dimension), image.mip_count,
+				             image_class.mip_count, static_cast<uint32_t>(image.conversion_format),
+				             static_cast<uint32_t>(image_class.conversion_format),
+				             image.shader_swizzle, image_class.shader_swizzle, image.cube ? 1 : 0,
+				             image_class.cube ? 1 : 0);
+				next_snapshot.images[candidate].dwords.fill(0);
+				image.numeric_class     = image_class.numeric_class;
+				image.dimension         = image_class.dimension;
+				image.mip_count         = image_class.mip_count;
+				image.conversion_format = image_class.conversion_format;
+				image.shader_swizzle    = image_class.shader_swizzle;
+				image.cube              = image_class.cube;
 			}
 		}
 	}
