@@ -6,6 +6,7 @@
 
 #include <array>
 #include <deque>
+#include <span>
 #include <unordered_map>
 
 namespace Libs::Graphics {
@@ -19,7 +20,9 @@ public:
 	~DescriptorHeap();
 	KYTY_CLASS_NO_COPY(DescriptorHeap);
 
-	[[nodiscard]] vk::DescriptorSet Commit(vk::DescriptorSetLayout layout);
+	// `sizes` are the descriptors of each type one set of `layout` needs.
+	[[nodiscard]] vk::DescriptorSet Commit(vk::DescriptorSetLayout                 layout,
+	                                       std::span<const vk::DescriptorPoolSize> sizes);
 
 private:
 	static constexpr uint32_t DescriptorSetBatch = 32;
@@ -31,7 +34,7 @@ private:
 	};
 
 	[[nodiscard]] bool Allocate(vk::DescriptorSetLayout layout, Batch& batch);
-	void               CreateDescriptorPool();
+	void               CreateDescriptorPool(std::span<const vk::DescriptorPoolSize> sizes = {});
 
 	GraphicContext&                                     m_graphics;
 	MasterSemaphore&                                    m_master_semaphore;

@@ -1932,8 +1932,10 @@ public:
       HW::Shader shaders{};
       scheduler.Begin(registers, user_config, shaders);
 
+      const std::array sizes{
+          vk::DescriptorPoolSize{vk::DescriptorType::eSampler, 48}};
       const auto commit = [&] {
-        const auto set = context.GetDescriptorHeap().Commit(layout);
+        const auto set = context.GetDescriptorHeap().Commit(layout, sizes);
         Require("DescriptorHeapLargeSet", "allocation", set != nullptr,
                 "ordinary descriptor heap could not allocate an oversized sampler set");
         scheduler.Current().Handle().bindDescriptorSets(
@@ -1949,6 +1951,36 @@ public:
         commit();
       }
     }
+
+    // A single set larger than a whole default pool (a big bindless table) gets a pool sized
+    // for it instead of failing the allocation.
+    vk::DescriptorSetLayoutBinding huge_binding{};
+    huge_binding.descriptorType = vk::DescriptorType::eSampler;
+    huge_binding.descriptorCount = 2048;
+    huge_binding.stageFlags = vk::ShaderStageFlagBits::eCompute;
+    create.bindingCount = 1;
+    create.pBindings = &huge_binding;
+    vk::DescriptorSetLayout huge_layout = nullptr;
+    RequireVk("DescriptorHeapLargeSet", "oversized layout",
+              m_device.createDescriptorSetLayout(&create, nullptr, &huge_layout),
+              "vkCreateDescriptorSetLayout");
+    {
+      RenderContext context(m_runtime_context);
+      auto &scheduler = context.GetCommandScheduler();
+      HW::Context registers{};
+      HW::UserConfig user_config{};
+      HW::Shader shaders{};
+      scheduler.Begin(registers, user_config, shaders);
+      const std::array sizes{vk::DescriptorPoolSize{
+          vk::DescriptorType::eSampler, huge_binding.descriptorCount}};
+      for (uint32_t i = 0; i < 12; i++) {
+        Require("DescriptorHeapLargeSet", "oversized allocation",
+                context.GetDescriptorHeap().Commit(huge_layout, sizes) != nullptr,
+                "a set larger than a default pool could not be allocated");
+      }
+      scheduler.Finish();
+    }
+    m_device.destroyDescriptorSetLayout(huge_layout, nullptr);
 
     m_device.destroyPipelineLayout(pipeline_layout, nullptr);
     m_device.destroyDescriptorSetLayout(layout, nullptr);

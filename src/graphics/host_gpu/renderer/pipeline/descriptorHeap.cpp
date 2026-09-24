@@ -5,11 +5,15 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/masterSemaphore.h"
 
+#include <algorithm>
+#include <vector>
+
 namespace Libs::Graphics {
 namespace {
 
-constexpr uint32_t   DescriptorHeapCount = 1024;
-constexpr std::array DescriptorPoolSizes = {
+constexpr uint32_t   DescriptorHeapCount  = 1024;
+constexpr uint32_t   LargeSetPoolCapacity = 8;
+constexpr std::array DescriptorPoolSizes  = {
     vk::DescriptorPoolSize {vk::DescriptorType::eStorageBuffer, 8192},
     vk::DescriptorPoolSize {vk::DescriptorType::eSampledImage, 8192},
     vk::DescriptorPoolSize {vk::DescriptorType::eStorageImage, 1024},
@@ -31,7 +35,8 @@ DescriptorHeap::~DescriptorHeap() {
 	}
 }
 
-vk::DescriptorSet DescriptorHeap::Commit(vk::DescriptorSetLayout layout) {
+vk::DescriptorSet DescriptorHeap::Commit(vk::DescriptorSetLayout                 layout,
+                                         std::span<const vk::DescriptorPoolSize> sizes) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(layout == nullptr);
 
@@ -54,7 +59,13 @@ vk::DescriptorSet DescriptorHeap::Commit(vk::DescriptorSetLayout layout) {
 
 	m_sets.clear();
 	auto& fresh_batch = m_sets[layout];
-	EXIT_IF(!Allocate(layout, fresh_batch));
+	if (!Allocate(layout, fresh_batch)) {
+		// A set larger than a default pool (big bindless tables): retire the empty pool for
+		// one sized to hold a few sets of this layout.
+		m_graphics.device.destroyDescriptorPool(m_current_pool, nullptr);
+		CreateDescriptorPool(sizes);
+		EXIT_IF(!Allocate(layout, fresh_batch));
+	}
 	return fresh_batch.sets[--fresh_batch.size];
 }
 
@@ -82,11 +93,21 @@ bool DescriptorHeap::Allocate(vk::DescriptorSetLayout layout, Batch& batch) {
 	}
 }
 
-void DescriptorHeap::CreateDescriptorPool() {
+void DescriptorHeap::CreateDescriptorPool(std::span<const vk::DescriptorPoolSize> sizes) {
+	std::vector<vk::DescriptorPoolSize> pool_sizes(DescriptorPoolSizes.begin(),
+	                                               DescriptorPoolSizes.end());
+	for (const auto& size: sizes) {
+		auto pool_size = std::ranges::find(pool_sizes, size.type, &vk::DescriptorPoolSize::type);
+		if (pool_size == pool_sizes.end()) {
+			pool_size = pool_sizes.insert(pool_size, {size.type, 0});
+		}
+		pool_size->descriptorCount =
+		    std::max(pool_size->descriptorCount, size.descriptorCount * LargeSetPoolCapacity);
+	}
 	vk::DescriptorPoolCreateInfo create {};
 	create.maxSets       = DescriptorHeapCount;
-	create.poolSizeCount = static_cast<uint32_t>(DescriptorPoolSizes.size());
-	create.pPoolSizes    = DescriptorPoolSizes.data();
+	create.poolSizeCount = static_cast<uint32_t>(pool_sizes.size());
+	create.pPoolSizes    = pool_sizes.data();
 	EXIT_IF(m_graphics.device.createDescriptorPool(&create, nullptr, &m_current_pool) !=
 	        vk::Result::eSuccess);
 }

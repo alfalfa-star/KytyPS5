@@ -15,6 +15,7 @@
 #include <span>
 #include <type_traits>
 #include <unordered_map>
+#include <vector>
 
 namespace Libs::Graphics {
 
@@ -33,29 +34,29 @@ struct ComputeShaderInfo;
 #pragma pack(push, 1)
 
 struct PipelineStaticParameters {
-	bool                       negative_one_to_one      = false;
-	bool                       depth_clip_enable        = true;
-	vk::PrimitiveTopology      topology                 = vk::PrimitiveTopology::ePointList;
-	bool                       primitive_restart_enable = false;
-	uint32_t                   samples                  = 1;
-	bool                       sample_shading_enable    = false;
-	bool                       depth_bounds_test_enable = false;
-	float                      depth_min_bounds         = 0.0f;
-	float                      depth_max_bounds         = 0.0f;
-	uint32_t                   color_mask[RENDER_COLOR_ATTACHMENTS_MAX]           = {};
-	bool                       cull_front                                         = false;
-	bool                       cull_back                                          = false;
-	bool                       face                                               = false;
-	bool                       provoking_vtx_last                                 = false;
-	vk::PolygonMode            polygon_mode                                       = vk::PolygonMode::eFill;
-	uint8_t                    color_srcblend[RENDER_COLOR_ATTACHMENTS_MAX]       = {};
-	uint8_t                    color_comb_fcn[RENDER_COLOR_ATTACHMENTS_MAX]       = {};
-	uint8_t                    color_destblend[RENDER_COLOR_ATTACHMENTS_MAX]      = {};
-	uint8_t                    alpha_srcblend[RENDER_COLOR_ATTACHMENTS_MAX]       = {};
-	uint8_t                    alpha_comb_fcn[RENDER_COLOR_ATTACHMENTS_MAX]       = {};
-	uint8_t                    alpha_destblend[RENDER_COLOR_ATTACHMENTS_MAX]      = {};
-	bool                       separate_alpha_blend[RENDER_COLOR_ATTACHMENTS_MAX] = {};
-	bool                       blend_enable[RENDER_COLOR_ATTACHMENTS_MAX]         = {};
+	bool                  negative_one_to_one      = false;
+	bool                  depth_clip_enable        = true;
+	vk::PrimitiveTopology topology                 = vk::PrimitiveTopology::ePointList;
+	bool                  primitive_restart_enable = false;
+	uint32_t              samples                  = 1;
+	bool                  sample_shading_enable    = false;
+	bool                  depth_bounds_test_enable = false;
+	float                 depth_min_bounds         = 0.0f;
+	float                 depth_max_bounds         = 0.0f;
+	uint32_t              color_mask[RENDER_COLOR_ATTACHMENTS_MAX]      = {};
+	bool                  cull_front                                    = false;
+	bool                  cull_back                                     = false;
+	bool                  face                                          = false;
+	bool                  provoking_vtx_last                            = false;
+	vk::PolygonMode       polygon_mode                                  = vk::PolygonMode::eFill;
+	uint8_t               color_srcblend[RENDER_COLOR_ATTACHMENTS_MAX]  = {};
+	uint8_t               color_comb_fcn[RENDER_COLOR_ATTACHMENTS_MAX]  = {};
+	uint8_t               color_destblend[RENDER_COLOR_ATTACHMENTS_MAX] = {};
+	uint8_t               alpha_srcblend[RENDER_COLOR_ATTACHMENTS_MAX]  = {};
+	uint8_t               alpha_comb_fcn[RENDER_COLOR_ATTACHMENTS_MAX]  = {};
+	uint8_t               alpha_destblend[RENDER_COLOR_ATTACHMENTS_MAX] = {};
+	bool                  separate_alpha_blend[RENDER_COLOR_ATTACHMENTS_MAX] = {};
+	bool                  blend_enable[RENDER_COLOR_ATTACHMENTS_MAX]         = {};
 
 	bool operator==(const PipelineStaticParameters& other) const noexcept;
 };
@@ -115,11 +116,13 @@ public:
 		vk::Pipeline            pipeline              = nullptr;
 		vk::DescriptorSetLayout descriptor_set_layout = nullptr;
 		bool                    uses_push_descriptors = false;
+		// Descriptors of each type one set of the layout needs.
+		std::vector<vk::DescriptorPoolSize> descriptor_pool_sizes;
 	};
 
 	struct GraphicsPrograms {
 		std::array<ShaderProgram, 3> vertex;
-		ShaderProgram pixel;
+		ShaderProgram                pixel;
 
 		[[nodiscard]] uint32_t VertexStageCount() const { return vertex[1] ? 3u : 1u; }
 	};
@@ -214,7 +217,7 @@ private:
 	std::unordered_map<GraphicsPipelineKey, std::unique_ptr<Pipeline>, GraphicsPipelineKeyHash>
 	                                                        m_graphics_pipelines;
 	std::unordered_map<uint64_t, std::unique_ptr<Pipeline>> m_compute_pipelines;
-	Common::Mutex m_mutex;
+	Common::Mutex                                           m_mutex;
 
 	void InitializeDriverCache();
 };
