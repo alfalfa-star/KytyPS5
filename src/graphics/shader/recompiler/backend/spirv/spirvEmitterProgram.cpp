@@ -97,10 +97,40 @@ void EmitReturn(ValueEmitContext& ctx) {
 }
 
 uint32_t BranchCondition(ValueEmitContext& ctx, const IR::BlockInfo& info) {
+	const auto kind = info.terminator.condition;
+	const bool zero = kind == CFG::BranchCondition::ExecZero ||
+	                  kind == CFG::BranchCondition::VccZero ||
+	                  kind == CFG::BranchCondition::SccZero;
+	const bool lane_mask =
+	    kind == CFG::BranchCondition::ExecZero || kind == CFG::BranchCondition::ExecNonZero ||
+	    kind == CFG::BranchCondition::VccZero || kind == CFG::BranchCondition::VccNonZero;
+	// S_CBRANCH_EXEC*/VCC* test the whole wave's mask, and the wave takes the branch together:
+	// inactive lanes run the region with their side effects predicated off. Branching per lane
+	// instead would split the wave, so a scalar decision inside the region (a ballot over the
+	// live mask, a barrier, a uniform early exit) would only see the lanes that entered it.
+	if (ctx.other_half == nullptr && lane_mask) {
+		auto& state = ctx.state;
+		// The lanes whose mask bit is set; a *Zero condition is the negated bit.
+		auto bit = ctx.Def(info.condition);
+		if (zero) {
+			bit = Unary(state, spv::OpLogicalNot, TypeBool(state), bit);
+		}
+		const auto ballot = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpGroupNonUniformBallot, TypeU32Vector(state, 4), ballot,
+		                          ConstantU32(state, spv::ScopeSubgroup), bit);
+		const auto low  = state.builder.AllocateId();
+		const auto high = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), low, ballot, 0);
+		state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), high, ballot, 1);
+		const auto any = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpINotEqual, TypeBool(state), any,
+		                          EmitBinaryU32(state, spv::OpBitwiseOr, low, high),
+		                          ConstantU32(state, 0));
+		return zero ? Unary(state, spv::OpLogicalNot, TypeBool(state), any) : any;
+	}
 	// Scalar-instruction conditions already test the full wave's raw register values.
-	if (ctx.other_half == nullptr ||
-	    info.terminator.condition == CFG::BranchCondition::ScalarInstruction ||
-	    info.terminator.condition == CFG::BranchCondition::GotoVariable) {
+	if (ctx.other_half == nullptr || kind == CFG::BranchCondition::ScalarInstruction ||
+	    kind == CFG::BranchCondition::GotoVariable) {
 		return ctx.Def(info.condition);
 	}
 	const auto ballot = ctx.Ballot(info.condition);
@@ -109,10 +139,6 @@ uint32_t BranchCondition(ValueEmitContext& ctx, const IR::BlockInfo& info) {
 	const auto result = ctx.state.builder.AllocateId();
 	ctx.state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(ctx.state), low, ballot, 0);
 	ctx.state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(ctx.state), high, ballot, 1);
-	const auto kind = info.terminator.condition;
-	const bool zero = kind == CFG::BranchCondition::ExecZero ||
-	                  kind == CFG::BranchCondition::VccZero ||
-	                  kind == CFG::BranchCondition::SccZero;
 	const auto combined =
 	    EmitBinaryU32(ctx.state, zero ? spv::OpBitwiseAnd : spv::OpBitwiseOr, low, high);
 	ctx.state.builder.AddFunction(zero ? spv::OpIEqual : spv::OpINotEqual, TypeBool(ctx.state),

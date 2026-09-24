@@ -193,6 +193,16 @@ Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program
 	    std::ranges::any_of(program.info.buffers, [](const IR::BufferResource& buffer) {
 		    return buffer.indirect_resources.size() >= 2u || buffer.indirect_arena;
 	    });
+	// EXEC/VCC branches are reduced over the subgroup (see BranchCondition).
+	requirements.subgroup_ballot =
+	    std::ranges::any_of(program.block_info, [](const IR::BlockInfo& info) {
+		    const auto kind = info.terminator.condition;
+		    return info.terminator.kind == CFG::TerminatorKind::ConditionalBranch &&
+		           (kind == CFG::BranchCondition::ExecZero ||
+		            kind == CFG::BranchCondition::ExecNonZero ||
+		            kind == CFG::BranchCondition::VccZero ||
+		            kind == CFG::BranchCondition::VccNonZero);
+	    });
 	for (const auto* block: program.blocks) {
 		for (const auto& inst: *block) {
 			if (IR::BufferAccessOf(inst.GetOpcode()) == IR::BufferAccess::Atomic &&

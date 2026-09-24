@@ -25028,6 +25028,38 @@ TestCase Wave64RawMasksAndScalarBranch() {
   return test;
 }
 
+// S_CBRANCH_EXECZ is taken by the whole wave, so lanes that are inactive when the region is
+// entered still run it: a scalar lane-mask operation inside sees every lane's bit.
+TestCase Wave64ExecBranchRegionSeesWholeWave() {
+  using O = ShaderOpcode;
+  std::vector<u32> code;
+  code.push_back(EncodeSMovB32(6, InlineU32(0)));
+  code.push_back(EncodeSop1(0x04, 4, 126));               // s_mov_b64 s[4:5], exec
+  code.push_back(EncodeSMovB32(127, InlineU32(0)));       // exec = lanes 0-31
+  const auto branch = code.size();
+  code.push_back(0);
+  code.push_back(EncodeSop1(0x10, 6, 4));                 // s_bcnt1_i32_b64 s6, s[4:5]
+  const auto join = code.size();
+  code[branch] = EncodeSopp(0x08, join - branch - 1);     // s_cbranch_execz join
+  code.push_back(EncodeSop1(0x04, 126, 193u));            // s_mov_b64 exec, -1
+  AppendStoreSgprAtLaneDwordOffset(&code, 6, 0, 0);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "Wave64ExecBranchRegionSeesWholeWave";
+  test.code = std::move(code);
+  test.initial.assign(64, 0xdeadbeef);
+  test.expected.assign(64, 64);
+  test.opcodes = {O::S_MOV_B32, O::S_MOV_B64, O::S_CBRANCH_EXECZ, O::S_BCNT1_I32_B64,
+                  O::V_MOV_B32, O::V_LSHLREV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.compute_info.threads_num[0] = 64;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.has_compute_info = true;
+  return test;
+}
+
 TestCase Wave64PartialMultidimensionalWorkgroup() {
   using O = ShaderOpcode;
   std::vector<u32> code;
@@ -27708,6 +27740,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(DsBpermuteWave64UsesIndependentHalves);
   AddCase(Wave64CrossHalfLaneAndLds);
   AddCase(Wave64RawMasksAndScalarBranch);
+  AddCase(Wave64ExecBranchRegionSeesWholeWave);
   AddCase(Wave64PartialMultidimensionalWorkgroup);
   AddCase(Wave64AppendConsumeHighHalf);
   AddCase(BufferAtomicVariants);
