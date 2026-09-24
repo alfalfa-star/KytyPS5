@@ -237,7 +237,7 @@ bool MaterializeIndirectTable(const DescriptorSource::IndirectTable& indirect,
 	const uint32_t min_stride   = indirect.via_pointer ? 8u : entry_dwords * 4u;
 	if ((entry_dwords != 8u && entry_dwords != 4u) || entry_stride < min_stride ||
 	    (entry_stride % sizeof(uint32_t)) != 0u) {
-		return false;
+		return SpecializationFail("indirect table has an unsupported entry layout");
 	}
 	// The heap is either a V# (bounds-checked like S_BUFFER_LOAD) or a raw S_LOAD base.
 	ShaderBufferResource heap;
@@ -247,10 +247,10 @@ bool MaterializeIndirectTable(const DescriptorSource::IndirectTable& indirect,
 		heap_base = ((static_cast<uint64_t>(heap_value.dwords[1]) << 32u) | heap_value.dwords[0]) &
 		            AddressMask;
 	} else if (!DecodeBufferDescriptor(heap_value, heap)) {
-		return false;
+		return SpecializationFail("indirect table heap is not a buffer descriptor");
 	}
 	if (indirect.heap_bounded && heap_address) {
-		return false;
+		return SpecializationFail("heap-bounded indirect table has an address heap");
 	}
 	// The byte offset of the field the key selects inside each heap record.
 	const uint32_t record_offset =
@@ -376,7 +376,8 @@ bool MaterializeIndirectTable(const DescriptorSource::IndirectTable& indirect,
 		} else {
 			for (uint32_t dword = 0; dword < candidate.dword_count; dword++) {
 				if (!ReadHeapWord(key, dword, candidate.dwords[dword])) {
-					return false;
+					return SpecializationFail(
+					    fmt::format("indirect table entry {} could not be read", key));
 				}
 			}
 		}
@@ -394,7 +395,8 @@ bool MaterializeIndirectTable(const DescriptorSource::IndirectTable& indirect,
 		const auto found = std::ranges::find(next.descriptors, candidate);
 		if (found == next.descriptors.end()) {
 			if (next.descriptors.size() >= max_resources) {
-				return false;
+				return SpecializationFail(fmt::format(
+				    "indirect table has more than {} distinct descriptors", max_resources));
 			}
 			next.descriptors.push_back(candidate);
 			next.candidates.push_back(static_cast<uint32_t>(next.descriptors.size() - 1u));
@@ -466,8 +468,10 @@ bool MaterializeTableSource(const ResourcePlan& program, const DescriptorSource&
 	if (!MaterializeIndirectTable(indirect, tables[0], tables[1], r128, key_limit, runtime,
 	                              table)) {
 		return SpecializationFail(fmt::format(
-		    "indirect table at heap offset 0x{:x} (stride {}, {} keys, limit {}) could not be read",
-		    indirect.heap_offset, indirect.entry_stride, indirect.key_count, key_limit));
+		    "indirect table at heap offset 0x{:x} ({} dwords, stride {}, {} keys, limit {}) could "
+		    "not be read",
+		    indirect.heap_offset, indirect.entry_dwords, indirect.entry_stride, indirect.key_count,
+		    key_limit));
 	}
 	return true;
 }

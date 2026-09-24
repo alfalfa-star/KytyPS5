@@ -307,8 +307,11 @@ struct PipelineCache::ProgramCache {
 		    .read_specialization_memory = ReadShaderGuestMemory,
 		};
 		if (entry != programs.end()) {
-			EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
-			    entry->second.resource_plan, runtime, resources, specialization));
+			if (!ShaderRecompiler::IR::MaterializeResources(entry->second.resource_plan, runtime,
+			                                                resources, specialization)) {
+				EXIT("resource materialization failed for shader hash=0x%016" PRIx64 "\n",
+				     params.hash);
+			}
 			if (const auto permutation = std::ranges::find_if(
 			        entry->second.permutations,
 			        [&](const Permutation& candidate) {
@@ -368,8 +371,11 @@ struct PipelineCache::ProgramCache {
 		auto translated = ShaderRecompiler::TranslateProgram(params.code, options);
 		if (entry == programs.end()) {
 			auto resource_plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
-			EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(resource_plan, runtime, resources,
-			                                                    specialization));
+			if (!ShaderRecompiler::IR::MaterializeResources(resource_plan, runtime, resources,
+			                                                specialization)) {
+				EXIT("resource materialization failed for shader hash=0x%016" PRIx64 "\n",
+				     params.hash);
+			}
 			entry = programs.try_emplace(lookup_key, std::move(resource_plan)).first;
 		}
 		entry->second.permutations.push_back(CompilePermutation(
