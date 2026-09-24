@@ -12,6 +12,7 @@
 #include <array>
 #include <unordered_map>
 #include <utility>
+#include <vector>
 
 namespace Libs::Graphics::ShaderRecompiler {
 namespace {
@@ -79,14 +80,67 @@ uint32_t ReflectTessellationStride(const Decoder::Program& program, bool local,
 		           ? value
 		           : Address {};
 	};
-	uint32_t stride = 0;
+	using Registers = std::array<Address, IR::NumVectorRegs>;
+	// Forward branches carry their register state to the target. At a join, a register
+	// keeps its reflection only when every incoming path agrees on it.
+	const auto merge = [](Registers& into, const Registers& other) {
+		for (size_t index = 0; index < into.size(); index++) {
+			const auto& lhs = into[index];
+			const auto& rhs = other[index];
+			if (lhs.kind != rhs.kind || lhs.coefficient != rhs.coefficient ||
+			    lhs.constant != rhs.constant)
+				into[index] = {};
+		}
+	};
+	// A loop header forgets every VGPR its body writes; that is the fixed point of a
+	// reflection that only keeps values all incoming paths agree on.
+	std::unordered_map<uint32_t, std::vector<uint32_t>> loop_writes;
+	for (const auto& branch: program.instructions) {
+		if (!IsDirectBranch(branch.opcode) || branch.branch_target > branch.pc) continue;
+		auto& written = loop_writes[branch.branch_target];
+		for (const auto& inst: program.instructions) {
+			if (inst.pc < branch.branch_target || inst.pc > branch.pc ||
+			    inst.dst.kind != OperandKind::Vgpr)
+				continue;
+			for (uint32_t index = 0; index < std::max(inst.data_dwords, 1u); index++) {
+				written.push_back(inst.dst.reg + index);
+			}
+		}
+	}
+	std::unordered_map<uint32_t, Registers> pending;
+	bool                                    reachable = true;
+	const auto                              exit_pc   = program.instructions.back().pc;
+	uint32_t                                stride    = 0;
 	for (const auto& inst: program.instructions) {
-		// Stage exits preserve the active path's definitions. An internal join
-		// would require merging register definitions.
-		EXIT_NOT_IMPLEMENTED(IsDirectBranch(inst.opcode) &&
-		                     inst.branch_target != program.instructions.back().pc);
+		if (const auto join = pending.find(inst.pc); join != pending.end()) {
+			if (reachable) {
+				merge(registers, join->second);
+			} else {
+				registers = join->second;
+			}
+			reachable = true;
+			pending.erase(join);
+		}
+		if (!reachable) continue;
+		if (const auto loop = loop_writes.find(inst.pc); loop != loop_writes.end()) {
+			for (const auto reg: loop->second) {
+				if (reg < registers.size()) registers[reg] = {};
+			}
+		}
+		if (IsDirectBranch(inst.opcode)) {
+			// Stage exits preserve the active path's definitions; loop headers were
+			// already widened above.
+			if (inst.branch_target > inst.pc && inst.branch_target != exit_pc) {
+				const auto [target, inserted] = pending.try_emplace(inst.branch_target, registers);
+				if (!inserted) merge(target->second, registers);
+			}
+			reachable = inst.opcode != Opcode::S_BRANCH;
+			continue;
+		}
 		const bool local_store =
-		    inst.opcode == Opcode::DS_WRITE_B32 || inst.opcode == Opcode::DS_WRITE2_B32;
+		    inst.opcode == Opcode::DS_WRITE_B32 || inst.opcode == Opcode::DS_WRITE2_B32 ||
+		    inst.opcode == Opcode::DS_WRITE_B64 || inst.opcode == Opcode::DS_WRITE_B96 ||
+		    inst.opcode == Opcode::DS_WRITE_B128;
 		const bool buffer_store = inst.opcode == Opcode::BUFFER_STORE_DWORD ||
 		                          inst.opcode == Opcode::BUFFER_STORE_DWORDX2 ||
 		                          inst.opcode == Opcode::BUFFER_STORE_DWORDX3 ||
@@ -94,7 +148,9 @@ uint32_t ReflectTessellationStride(const Decoder::Program& program, bool local,
 		const bool control_store =
 		    !local && buffer_store && inst.src2.kind == OperandKind::Sgpr && inst.src2.reg == 2u;
 		const bool control_read =
-		    !local && (inst.opcode == Opcode::DS_READ_B32 || inst.opcode == Opcode::DS_READ2_B32);
+		    !local && (inst.opcode == Opcode::DS_READ_B32 || inst.opcode == Opcode::DS_READ2_B32 ||
+		               inst.opcode == Opcode::DS_READ_B64 || inst.opcode == Opcode::DS_READ_B96 ||
+		               inst.opcode == Opcode::DS_READ_B128);
 		if ((local && local_store) || control_store || control_read) {
 			const auto address = read(inst.src0);
 			if (address.kind != Kind::Affine) {
@@ -123,6 +179,14 @@ uint32_t ReflectTessellationStride(const Decoder::Program& program, bool local,
 					if (rhs.constant == 0u && third.constant == 8u) value = constant(0u);
 				}
 				break;
+			case Opcode::V_AND_B32:
+				// The packed HS ID's low byte is the patch ordinal, like an SDWA byte-0 read.
+				if ((lhs.kind == Kind::PackedControlPoint && rhs.kind == Kind::Affine &&
+				     rhs.coefficient == 0u && rhs.constant == 0xffu) ||
+				    (rhs.kind == Kind::PackedControlPoint && lhs.kind == Kind::Affine &&
+				     lhs.coefficient == 0u && lhs.constant == 0xffu))
+					value = constant(0u);
+				break;
 			case Opcode::V_MUL_U32_U24: value = multiply(low24(lhs), low24(rhs)); break;
 			case Opcode::V_MAD_U32_U24: value = add(multiply(low24(lhs), low24(rhs)), third); break;
 			case Opcode::V_LSHL_ADD_U32:
@@ -133,6 +197,7 @@ uint32_t ReflectTessellationStride(const Decoder::Program& program, bool local,
 				if (lhs.kind == Kind::Affine && lhs.coefficient == 0u && lhs.constant < 32u)
 					value = multiply(rhs, constant(1u << lhs.constant));
 				break;
+			case Opcode::V_ADD_NC_U32: value = add(lhs, rhs); break;
 			case Opcode::V_SUB_NC_U32:
 				if (lhs.kind == Kind::Affine && rhs.kind == Kind::Affine &&
 				    lhs.coefficient >= rhs.coefficient && lhs.constant >= rhs.constant)
@@ -144,7 +209,8 @@ uint32_t ReflectTessellationStride(const Decoder::Program& program, bool local,
 		    inst.dst.dpp)
 			value = {};
 		for (uint32_t index = 0;
-		     index < std::max(inst.data_dwords, 1u) && inst.dst.reg + index < registers.size(); index++) {
+		     index < std::max(inst.data_dwords, 1u) && inst.dst.reg + index < registers.size();
+		     index++) {
 			registers[inst.dst.reg + index] = {};
 		}
 		registers.at(inst.dst.reg) = value;
@@ -323,7 +389,7 @@ void LowerTessellationMemory(IR::Program& program, const CompileOptions& options
 	LOGF("%s tessellation lowering: reads=%u writes=%u factors=%u\n",
 	     options.stage == ShaderType::Local                 ? "LS"
 	     : options.stage == ShaderType::TessellationControl ? "HS"
-	                                                       : "TES",
+	                                                        : "TES",
 	     reads, writes, factors);
 }
 
