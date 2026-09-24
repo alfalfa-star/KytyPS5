@@ -567,6 +567,16 @@ private:
 		});
 	}
 
+	// Every use of the first `width` table reads is a descriptor handle like `handle`.
+	static bool ReadsFeedOnlyHandles(const std::array<Inst*, 8>& reads, const Inst& handle,
+	                                 uint32_t width) {
+		return std::all_of(reads.begin(), reads.begin() + width, [&](const Inst* read) {
+			return !read->Uses().empty() && std::ranges::all_of(read->Uses(), [&](const Use& use) {
+				return use.user->GetOpcode() == handle.GetOpcode() && use.user->NumArgs() == width;
+			});
+		});
+	}
+
 	static bool UsesOnly(const Inst& value, std::span<const Inst* const> users) {
 		return !value.Uses().empty() && std::ranges::all_of(value.Uses(), [&](const Use& use) {
 			return std::ranges::find(users, use.user) != users.end();
@@ -880,9 +890,12 @@ private:
 		} else {
 			return false;
 		}
+		// The record index is wave-uniform: the first active lane's, or the lane a waterfall
+		// loop picked for this iteration.
 		const auto* selector_inst = selector.TryInstruction();
 		return stride != 0u && selector_inst != nullptr &&
-		       selector_inst->GetOpcode() == ValueOpcode::ReadFirstLane;
+		       (selector_inst->GetOpcode() == ValueOpcode::ReadFirstLane ||
+		        selector_inst->GetOpcode() == ValueOpcode::ReadLane);
 	}
 
 	// Matches `handle` against a descriptor-table fetch: every dword is a scalar read of the same
@@ -1207,14 +1220,13 @@ private:
 		}
 		std::array<const Inst*, 10> heap_users {};
 		std::copy(heap_reads.begin(), heap_reads.end(), heap_users.begin());
-		heap_users[8] = pointer_reads[0];
-		heap_users[9] = pointer_reads[1];
-		const std::array<const Inst*, 1> table_users {&handle};
-		uint32_t                         key_count = 0;
-		Value                            key_bound;
-		bool bounded      = BoundedKeyRange(Value(material_read), key_count) ||
-		                    LoopBoundedKey(Value(material_read), key_count, key_bound);
-		bool heap_bounded = false;
+		heap_users[8]      = pointer_reads[0];
+		heap_users[9]      = pointer_reads[1];
+		uint32_t key_count = 0;
+		Value    key_bound;
+		bool     bounded      = BoundedKeyRange(Value(material_read), key_count) ||
+		                        LoopBoundedKey(Value(material_read), key_count, key_bound);
+		bool     heap_bounded = false;
 		if (!bounded && heap_handle->GetOpcode() == ValueOpcode::GetBufferResource) {
 			// Neither a small computed range nor a material-record read (that form is matched
 			// below): fall back to the heap V#'s size, which S_BUFFER_LOAD bounds-checks.
@@ -1261,14 +1273,8 @@ private:
 			}
 			// One fetched entry may feed several accesses (e.g. a loop body sampling the
 			// selected texture more than once); each handle becomes a plan over the same table.
-			for (uint32_t dword = 0; dword < width; dword++) {
-				const auto& read = *heap_reads[dword];
-				if (read.Uses().empty() || !std::ranges::all_of(read.Uses(), [&](const Use& use) {
-					    return use.user->GetOpcode() == handle.GetOpcode() &&
-					           use.user->NumArgs() == width;
-				    })) {
-					return false;
-				}
+			if (!ReadsFeedOnlyHandles(heap_reads, handle, width)) {
+				return false;
 			}
 			DescriptorSource heap_source;
 			uint32_t         heap_source_index = 0;
@@ -1330,14 +1336,15 @@ private:
 			return false;
 		}
 
-		const std::array<const Inst*, 1> material_users {shift};
-		if (!UsesOnly(*material_read, material_users) || !UsesOnly(*shift, heap_users)) {
+		// The key stays a runtime load, so the shader may also test it (e.g. against a null
+		// index); only the scaled offset must be ours.
+		if (!UsesOnly(*shift, heap_users)) {
 			return false;
 		}
-		for (uint32_t dword = 0; dword < width; dword++) {
-			if (!UsesOnly(*heap_reads[dword], table_users)) {
-				return false;
-			}
+		// One fetched entry may feed several accesses; each handle becomes a plan over the
+		// same table.
+		if (!ReadsFeedOnlyHandles(heap_reads, handle, width)) {
+			return false;
 		}
 
 		DescriptorSource material_source;
