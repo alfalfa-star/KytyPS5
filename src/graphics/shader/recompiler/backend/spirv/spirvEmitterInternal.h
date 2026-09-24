@@ -98,6 +98,8 @@ struct EmitterState {
 		uint32_t resource    = UINT32_MAX;
 		uint32_t array_index = 0;
 		uint32_t byte_offset = 0;
+		// An arena entry's own end, in dwords from the binding start (0 when unbounded).
+		uint32_t length_limit = 0;
 	} indirect_buffer;
 	uint32_t                                       bda_pagetable_variable       = 0;
 	uint32_t                                       fault_buffer_variable        = 0;
@@ -395,6 +397,8 @@ MemoryResourceAccess PrepareMemoryResourceAccess(EmitterState& state, const IR::
 uint32_t EmitIndirectTableSelection(EmitterState& state, uint32_t key, uint32_t mapping_offset,
                                     uint32_t search_iterations);
 
+uint32_t LoadFlattenedSrtDword(EmitterState& state, uint32_t index);
+
 // Selects the dense buffer a table-indexed memory operation addresses for the duration of its
 // emission (see EmitterState::indirect_buffer).
 class IndirectBufferScope {
@@ -405,6 +409,8 @@ public:
 	IndirectBufferScope& operator=(const IndirectBufferScope&) = delete;
 
 private:
+	void SelectArenaEntry(const IR::BufferResource& buffer, uint32_t resource, uint32_t selected);
+
 	EmitterState& m_state;
 };
 

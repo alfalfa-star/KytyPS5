@@ -191,7 +191,7 @@ Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program
 	SpirvRequirements requirements {};
 	requirements.buffer_dynamic_indexing =
 	    std::ranges::any_of(program.info.buffers, [](const IR::BufferResource& buffer) {
-		    return buffer.indirect_resources.size() >= 2u;
+		    return buffer.indirect_resources.size() >= 2u || buffer.indirect_arena;
 	    });
 	for (const auto* block: program.blocks) {
 		for (const auto& inst: *block) {

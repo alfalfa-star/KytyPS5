@@ -85,12 +85,14 @@ MemoryResourceAccess PrepareStorageBufferResourceAccess(EmitterState&         st
 	}
 	MemoryResourceAccess access {.kind = mem.kind};
 	access.object_pointer = state.builder.AllocateId();
+	uint32_t length_limit = 0;
 	if (state.indirect_buffer.resource == mem.resource) {
 		// A table entry chosen by key: the array index is dynamically uniform (the key is an
 		// SGPR value), so plain dynamic indexing of the descriptor array is enough.
 		state.builder.AddFunction(spv::OpAccessChain, pointer_type, access.object_pointer, variable,
 		                          state.indirect_buffer.array_index);
 		access.byte_offset = state.indirect_buffer.byte_offset;
+		length_limit       = state.indirect_buffer.length_limit;
 	} else {
 		const auto array_index =
 		    ResourceForDescriptor(state, IR::DescriptorBindingKind::Buffers, mem.resource);
@@ -101,24 +103,31 @@ MemoryResourceAccess PrepareStorageBufferResourceAccess(EmitterState&         st
 	access.length = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpArrayLength, TypeU32(state), access.length,
 	                          access.object_pointer, 0);
+	if (length_limit != 0u) {
+		access.length =
+		    Select(state, TypeU32(state),
+		           Binary(state, spv::OpULessThan, TypeBool(state), length_limit, access.length),
+		           length_limit, access.length);
+	}
 	return access;
+}
+
+uint32_t LoadFlattenedSrtDword(EmitterState& state, uint32_t index) {
+	const auto pointer = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(state), pointer,
+	                          state.flattened_srt_variable, ConstantU32(state, 0), index);
+	const auto value = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, pointer);
+	return value;
 }
 
 uint32_t EmitIndirectTableSelection(EmitterState& state, uint32_t key, uint32_t mapping_offset,
                                     uint32_t search_iterations) {
-	const auto LoadMapping = [&](uint32_t index) {
-		const auto pointer = state.builder.AllocateId();
-		state.builder.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(state),
-		                          pointer, state.flattened_srt_variable, ConstantU32(state, 0),
-		                          index);
-		const auto value = state.builder.AllocateId();
-		state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, pointer);
-		return value;
-	};
-	const auto mapping  = ConstantU32(state, mapping_offset);
-	auto       low      = ConstantU32(state, 0u);
-	auto       high     = LoadMapping(mapping);
-	auto       selected = ConstantU32(state, 0u);
+	const auto LoadMapping = [&](uint32_t index) { return LoadFlattenedSrtDword(state, index); };
+	const auto mapping     = ConstantU32(state, mapping_offset);
+	auto       low         = ConstantU32(state, 0u);
+	auto       high        = LoadMapping(mapping);
+	auto       selected    = ConstantU32(state, 0u);
 	for (uint32_t iteration = 0; iteration < search_iterations; iteration++) {
 		const auto active = Binary(state, spv::OpULessThan, TypeBool(state), low, high);
 		const auto mid =
@@ -168,7 +177,8 @@ IndirectBufferScope::IndirectBufferScope(ValueEmitContext& ctx, const IR::Inst& 
 		return;
 	}
 	const auto& buffer = m_state.program.info.buffers[mem.resource];
-	if (buffer.indirect_root != mem.resource || buffer.indirect_resources.size() < 2u) {
+	if (buffer.indirect_root != mem.resource ||
+	    (buffer.indirect_resources.size() < 2u && !buffer.indirect_arena)) {
 		return;
 	}
 	const auto* handle = inst.Arg(0).ResolveInstruction();
@@ -185,6 +195,10 @@ IndirectBufferScope::IndirectBufferScope(ValueEmitContext& ctx, const IR::Inst& 
 	const auto key      = ctx.Def(handle->Arg(source->indirect_table->key_arg));
 	const auto selected = EmitIndirectTableSelection(m_state, key, buffer.indirect_mapping_offset,
 	                                                 buffer.indirect_search_iterations);
+	if (buffer.indirect_arena) {
+		SelectArenaEntry(buffer, mem.resource, selected);
+		return;
+	}
 	// Resolve the candidate to its dense array slot and byte offset with a select chain; the
 	// tables are small and this keeps the access itself identical to a direct buffer.
 	auto array_index =
@@ -204,6 +218,52 @@ IndirectBufferScope::IndirectBufferScope(ValueEmitContext& ctx, const IR::Inst& 
 	}
 	m_state.indirect_buffer = {
 	    .resource = mem.resource, .array_index = array_index, .byte_offset = byte_offset};
+}
+
+// The candidate's record names its arena, its byte offset within it and its byte size; the
+// access addresses the arena from that offset and treats bytes past the size as out of bounds.
+void IndirectBufferScope::SelectArenaEntry(const IR::BufferResource& buffer, uint32_t resource,
+                                           uint32_t selected) {
+	auto&      state = m_state;
+	const auto record =
+	    Binary(state, spv::OpIAdd, TypeU32(state), ConstantU32(state, buffer.indirect_arena_offset),
+	           Binary(state, spv::OpIMul, TypeU32(state), selected,
+	                  ConstantU32(state, IR::BufferArenaRecordDwords)));
+	const auto field = [&](uint32_t index) {
+		return LoadFlattenedSrtDword(
+		    state, Binary(state, spv::OpIAdd, TypeU32(state), record, ConstantU32(state, index)));
+	};
+	const auto arena  = field(0);
+	const auto offset = field(1);
+	const auto size   = field(2);
+	auto       array_index =
+	    ConstantU32(state, ResourceForDescriptor(state, IR::DescriptorBindingKind::Buffers,
+	                                             buffer.indirect_resources[0]));
+	auto base_offset = state.memory_byte_offsets[ResourceForDescriptor(
+	    state, IR::DescriptorBindingKind::Buffers, buffer.indirect_resources[0])];
+	for (uint32_t candidate = 1; candidate < buffer.indirect_resources.size(); candidate++) {
+		const auto slot = ResourceForDescriptor(state, IR::DescriptorBindingKind::Buffers,
+		                                        buffer.indirect_resources[candidate]);
+		const auto match =
+		    Binary(state, spv::OpIEqual, TypeBool(state), arena, ConstantU32(state, candidate));
+		array_index = Select(state, TypeU32(state), match, ConstantU32(state, slot), array_index);
+		base_offset =
+		    Select(state, TypeU32(state), match, state.memory_byte_offsets[slot], base_offset);
+	}
+	const auto byte_offset = Binary(state, spv::OpIAdd, TypeU32(state), base_offset, offset);
+	const auto end_dwords =
+	    Binary(state, spv::OpShiftRightLogical, TypeU32(state),
+	           Binary(state, spv::OpIAdd, TypeU32(state),
+	                  Binary(state, spv::OpIAdd, TypeU32(state), byte_offset, size),
+	                  ConstantU32(state, 3u)),
+	           ConstantU32(state, 2u));
+	const auto empty = Binary(state, spv::OpIEqual, TypeBool(state), size, ConstantU32(state, 0u));
+	state.indirect_buffer = {
+	    .resource     = resource,
+	    .array_index  = array_index,
+	    .byte_offset  = byte_offset,
+	    .length_limit = Select(state, TypeU32(state), empty, ConstantU32(state, 0u), end_dwords),
+	};
 }
 
 IndirectBufferScope::~IndirectBufferScope() {

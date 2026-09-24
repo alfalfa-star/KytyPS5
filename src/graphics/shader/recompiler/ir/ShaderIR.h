@@ -89,6 +89,8 @@ struct ExportInfo {
 	bool operator==(const ExportInfo& other) const = default;
 };
 
+constexpr uint32_t BufferArenaRecordDwords = 3u;
+
 struct BufferResource {
 	static constexpr uint32_t NoImageAlias     = UINT32_MAX;
 	static constexpr uint32_t NoIndirectBuffer = UINT32_MAX;
@@ -112,6 +114,10 @@ struct BufferResource {
 	uint32_t              indirect_mapping_offset    = 0;
 	uint32_t              indirect_search_iterations = 0;
 	std::vector<uint32_t> indirect_resources;
+	// A table too large for dense candidates binds a few arenas instead; the flattened SRT then
+	// holds a BufferArenaRecordDwords record (arena, byte offset, byte size) per candidate.
+	bool     indirect_arena        = false;
+	uint32_t indirect_arena_offset = 0;
 
 	bool operator==(const BufferResource& other) const = default;
 };

@@ -20,6 +20,13 @@ namespace {
 
 constexpr uint64_t AddressMask            = 0x0000ffffffffffffull;
 constexpr uint64_t MaxIndirectImageProbes = 65536u;
+// A buffer table with more candidates than this is bound as a few covering arenas instead of
+// one dense buffer per candidate (see BuildBufferArenas).
+constexpr size_t MaxDenseBufferCandidates = 64u;
+constexpr size_t MaxBufferArenas          = 32u;
+// Candidates closer than this share an arena; the gap is bound (and never addressed) too.
+constexpr uint64_t MaxBufferArenaGap  = 4ull << 20u;
+constexpr uint64_t MaxBufferArenaSpan = 256ull << 20u;
 
 struct IndirectTable {
 	uint32_t                     resource = 0;
@@ -357,9 +364,9 @@ bool MaterializeIndirectTable(const DescriptorSource::IndirectTable& indirect,
 	}
 
 	// A sampler table is collapsed to one S# later; keep every distinct entry for that choice.
-	const size_t  max_resources = indirect.sampler     ? SIZE_MAX
-	                              : entry_dwords == 8u ? ShaderInfo::MaxImages
-	                                                   : ShaderInfo::MaxBuffers;
+	// A large buffer table is bound as arenas, so only image tables are limited here.
+	const size_t max_resources =
+	    entry_dwords == 8u && !indirect.sampler ? ShaderInfo::MaxImages : SIZE_MAX;
 	IndirectTable next;
 	next.keys = std::move(keys);
 	next.candidates.reserve(next.keys.size());
@@ -629,6 +636,131 @@ struct ImageRemap {
 template <typename Images>
 bool BuildSamplerPlan(const ShaderInfo& base, const Images& images, SamplerPlan& plan);
 
+// Binds a buffer table too large for one dense buffer per candidate as a few arenas: ranges of
+// guest memory covering neighbouring candidates (typically sub-allocations of one pool). The
+// root and up to MaxBufferArenas - 1 appended buffers are the arenas; the flattened SRT gets a
+// (arena, byte offset, byte size) record per candidate, which the shader reads after the key
+// lookup instead of choosing among dense candidates.
+template <typename SpecializeBuffer>
+static bool BuildBufferArenas(const ResourcePlan& program, const IndirectTable& table,
+                              const SpecializeBuffer& specialize_buffer, ResourceSnapshot& snapshot,
+                              ResourceSpecialization& specialization) {
+	const auto pc = program.info.buffers[table.resource].first_use_pc;
+	struct Candidate {
+		ShaderBufferResource           descriptor;
+		ResourceSpecialization::Buffer buffer;
+		bool                           typed = false;
+	};
+	std::vector<Candidate> candidates(table.descriptors.size());
+	const Candidate*       exemplar = nullptr;
+	for (size_t index = 0; index < candidates.size(); index++) {
+		auto  value     = table.descriptors[index];
+		auto& candidate = candidates[index];
+		if (!specialize_buffer(value, table.resource, candidate.buffer) ||
+		    !DecodeBufferDescriptor(value, candidate.descriptor)) {
+			return SpecializationFail("indirect buffer candidate has an invalid descriptor");
+		}
+		candidate.typed = !NullBufferDescriptor(value) && candidate.descriptor.GetSize() != 0u;
+		if (exemplar == nullptr && candidate.typed) {
+			exemplar = &candidate;
+		}
+	}
+	if (exemplar == nullptr) {
+		return SpecializationFail("indirect buffer table has no typed candidate");
+	}
+	// Arena offsets address bytes directly, which a swizzled layout does not.
+	if (exemplar->descriptor.SwizzleEnabled()) {
+		return SpecializationFail(fmt::format(
+		    "indirect buffer table at pc 0x{:08x} is too large for swizzled candidates", pc));
+	}
+	uint32_t dropped = 0;
+	for (auto& candidate: candidates) {
+		if (candidate.typed && !(candidate.buffer == exemplar->buffer)) {
+			candidate.typed = false;
+			dropped++;
+		}
+	}
+	if (dropped != 0u) {
+		std::fprintf(stderr,
+		             "shader resource specialization: indirect buffer table at pc 0x%08x drops %u "
+		             "incompatible candidates\n",
+		             pc, dropped);
+	}
+
+	struct Arena {
+		uint64_t begin = 0;
+		uint64_t end   = 0;
+	};
+	std::vector<uint32_t> order;
+	for (uint32_t index = 0; index < candidates.size(); index++) {
+		if (candidates[index].typed) {
+			order.push_back(index);
+		}
+	}
+	std::ranges::sort(order, {},
+	                  [&](uint32_t index) { return candidates[index].descriptor.Base48(); });
+	std::vector<Arena> arenas;
+	for (const auto index: order) {
+		const auto begin = candidates[index].descriptor.Base48();
+		const auto end   = begin + candidates[index].descriptor.GetSize();
+		if (!arenas.empty() && begin <= arenas.back().end + MaxBufferArenaGap &&
+		    std::max(end, arenas.back().end) - arenas.back().begin <= MaxBufferArenaSpan) {
+			arenas.back().end = std::max(end, arenas.back().end);
+		} else {
+			arenas.push_back({begin, end});
+		}
+	}
+	if (arenas.size() > MaxBufferArenas) {
+		return SpecializationFail(
+		    fmt::format("indirect buffer table at pc 0x{:08x} spans {} arenas (limit {})", pc,
+		                arenas.size(), MaxBufferArenas));
+	}
+
+	auto& root                 = specialization.buffers[table.resource];
+	root                       = {.packed_stride              = exemplar->buffer.packed_stride,
+	                              .descriptor_format          = exemplar->buffer.descriptor_format,
+	                              .descriptor_swizzle         = exemplar->buffer.descriptor_swizzle,
+	                              .indirect_root              = root.indirect_root,
+	                              .indirect_mapping_offset    = root.indirect_mapping_offset,
+	                              .indirect_search_iterations = root.indirect_search_iterations,
+	                              .indirect_arena             = true};
+	root.indirect_arena_offset = static_cast<uint32_t>(snapshot.flattened_srt.size());
+	snapshot.flattened_srt.resize(snapshot.flattened_srt.size() +
+	                              candidates.size() * BufferArenaRecordDwords);
+	for (size_t index = 0; index < candidates.size(); index++) {
+		const auto& candidate = candidates[index];
+		auto*       record =
+		    &snapshot.flattened_srt[root.indirect_arena_offset + index * BufferArenaRecordDwords];
+		if (!candidate.typed) {
+			continue; // A null record: arena 0, empty range.
+		}
+		const auto base  = candidate.descriptor.Base48();
+		const auto arena = std::ranges::find_if(
+		    arenas, [&](const Arena& range) { return base >= range.begin && base < range.end; });
+		record[0] = static_cast<uint32_t>(arena - arenas.begin());
+		record[1] = static_cast<uint32_t>(base - arena->begin);
+		record[2] = static_cast<uint32_t>(candidate.descriptor.GetSize());
+	}
+	const auto stride = std::max<uint32_t>(exemplar->descriptor.Stride(), 1u);
+	for (size_t index = 0; index < arenas.size(); index++) {
+		DescriptorValue value = table.descriptors[exemplar - candidates.data()];
+		value.dwords[0]       = static_cast<uint32_t>(arenas[index].begin);
+		value.dwords[1]       = (value.dwords[1] & 0xffff0000u) |
+		                        static_cast<uint32_t>((arenas[index].begin >> 32u) & 0xffffu);
+		value.dwords[2] =
+		    static_cast<uint32_t>((arenas[index].end - arenas[index].begin + stride - 1u) / stride);
+		if (index == 0u) {
+			snapshot.buffers[table.resource] = value;
+			continue;
+		}
+		snapshot.buffers.push_back(value);
+		auto buffer          = exemplar->buffer;
+		buffer.indirect_root = table.resource;
+		specialization.buffers.push_back(buffer);
+	}
+	return true;
+}
+
 static bool BuildResourceSpecialization(const ResourcePlan& program, MaterializedSnapshot snapshot,
                                         ResourceSnapshot&       specialized_snapshot,
                                         ResourceSpecialization& specialization) {
@@ -701,8 +833,10 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, Materialize
 	size_t buffer_count         = program.info.buffers.size();
 	size_t buffer_mapping_words = 0;
 	for (const auto& table: snapshot.indirect_buffers) {
+		const bool   arenas = table.descriptors.size() > MaxDenseBufferCandidates;
+		const size_t extra  = arenas ? MaxBufferArenas - 1u : table.descriptors.size() - 1u;
 		if (table.resource >= program.info.buffers.size() || table.descriptors.size() < 2u ||
-		    buffer_count + table.descriptors.size() - 1u > ShaderInfo::MaxBuffers) {
+		    buffer_count + extra > ShaderInfo::MaxBuffers) {
 			return SpecializationFail(fmt::format(
 			    "indirect buffer candidates exceed the dense buffer resource limit ({} tables, "
 			    "table at pc 0x{:x} has {} keys / {} candidates, {} buffers so far)",
@@ -712,8 +846,9 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, Materialize
 			        : 0u,
 			    table.keys.size(), table.descriptors.size(), buffer_count));
 		}
-		buffer_count += table.descriptors.size() - 1u;
-		buffer_mapping_words += 1u + table.keys.size() * 2u;
+		buffer_count += extra;
+		buffer_mapping_words += 1u + table.keys.size() * 2u +
+		                        (arenas ? table.descriptors.size() * BufferArenaRecordDwords : 0u);
 	}
 	next_snapshot.buffers.reserve(buffer_count);
 	next_snapshot.flattened_srt.reserve(next_snapshot.flattened_srt.size() + buffer_mapping_words);
@@ -768,6 +903,13 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, Materialize
 			const auto offset                   = root.indirect_mapping_offset + 1u + entry * 2u;
 			next_snapshot.flattened_srt[offset] = table.keys[source];
 			next_snapshot.flattened_srt[offset + 1] = table.candidates[source];
+		}
+		if (table.descriptors.size() > MaxDenseBufferCandidates) {
+			if (!BuildBufferArenas(program, table, specialize_buffer, next_snapshot,
+			                       next_specialization)) {
+				return false;
+			}
+			continue;
 		}
 		next_snapshot.buffers[table.resource] = table.descriptors[0];
 		ResourceSpecialization::Buffer exemplar;
@@ -1446,6 +1588,8 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 		buffer.indirect_root              = source.indirect_root;
 		buffer.indirect_mapping_offset    = source.indirect_mapping_offset;
 		buffer.indirect_search_iterations = source.indirect_search_iterations;
+		buffer.indirect_arena             = source.indirect_arena;
+		buffer.indirect_arena_offset      = source.indirect_arena_offset;
 		buffer.indirect_resources.clear();
 	}
 	for (uint32_t index = 0; index < buffers.size(); index++) {
