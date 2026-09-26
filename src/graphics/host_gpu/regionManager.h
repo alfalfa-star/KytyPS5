@@ -2,6 +2,7 @@
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_REGIONMANAGER_H_
 
 #include "common/assert.h"
+#include "common/perfTmp.h" // PERFTMP
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/regionDefinitions.h"
 
@@ -148,6 +149,7 @@ private:
 			return;
 		}
 		previous = protection;
+		PERFTMP_SCOPE("UpdatePageWatchersForRegion"); // PERFTMP
 		m_page_manager.UpdatePageWatchersForRegion<track, is_read>(m_cpu_addr, mask);
 	}
 

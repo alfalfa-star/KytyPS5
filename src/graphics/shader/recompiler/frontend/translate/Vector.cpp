@@ -113,6 +113,15 @@ bool Translator::EmitVector(const Decoder::Instruction& inst) {
 		case O::V_CMPX_NE_U64:
 			EmitIntegerCompare(inst, IR::ValueOpcode::INotEqual64, IR::Type::U64, false, true);
 			return true;
+		case O::V_CMPX_LT_U64:
+			EmitIntegerCompare(inst, IR::ValueOpcode::ULessThan64, IR::Type::U64, false, true);
+			return true;
+		case O::V_CMPX_EQ_U64:
+			EmitIntegerCompare(inst, IR::ValueOpcode::IEqual64, IR::Type::U64, false, true);
+			return true;
+		case O::V_CMPX_GT_U64:
+			EmitIntegerCompare(inst, IR::ValueOpcode::UGreaterThan64, IR::Type::U64, false, true);
+			return true;
 
 		case O::V_CMP_EQ_U16:
 			EmitInteger16Compare(inst, IR::ValueOpcode::IEqual32, false, false);

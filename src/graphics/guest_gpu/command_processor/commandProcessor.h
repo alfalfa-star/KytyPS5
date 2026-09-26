@@ -100,6 +100,8 @@ public:
 	void DispatchDirect(uint32_t thread_group_x, uint32_t thread_group_y, uint32_t thread_group_z,
 	                    uint32_t mode);
 	void DispatchIndirect(uint32_t data_offset, uint32_t mode);
+	// Dispatches with the three group-count dwords at a guest address.
+	void DispatchIndirectAt(uint64_t args_address, uint32_t mode);
 	void WaitFlipDone(uint32_t video_out_handle, uint32_t display_buffer_index);
 	void TriggerEvent(uint32_t event_type, uint32_t event_index, uint64_t event_address = 0);
 
@@ -146,9 +148,9 @@ private:
 	                      uint32_t interrupt_context_id);
 	void ProcessPm4(Pm4Execution& execution);
 	void SuspendPm4();
-	CommandScheduler&   GetScheduler() const { return m_renderer.GetCommandScheduler(); }
-	CommandBuffer&      CurrentBuffer() { return GetScheduler().Current(); }
-	void                CheckBuffer() const { GetScheduler().CheckActive(); }
+	CommandScheduler& GetScheduler() const { return m_renderer.GetCommandScheduler(); }
+	CommandBuffer&    CurrentBuffer() { return GetScheduler().Current(); }
+	void              CheckBuffer() const { GetScheduler().CheckActive(); }
 
 	RenderContext&   m_renderer;
 	HW::Context      m_ctx;

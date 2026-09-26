@@ -46,6 +46,9 @@ constexpr FormatMapping kFormatMappings[] = {
     {Prospero::BufferFormat::k16_16SInt, vk::Format::eR16G16Sint},
     {Prospero::BufferFormat::k16_16Float, vk::Format::eR16G16Sfloat},
     {Prospero::BufferFormat::k11_11_10Float, vk::Format::eB10G11R11UfloatPack32},
+    // Vulkan has no 11:11:10 UNORM format. The packed float format has the same bit layout, so
+    // GPU-side writes and reads round-trip; bits the CPU writes or reads back decode differently.
+    {Prospero::BufferFormat::k11_11_10UNorm, vk::Format::eB10G11R11UfloatPack32},
     {Prospero::BufferFormat::k10_10_10_2UNorm, vk::Format::eA2B10G10R10UnormPack32},
     {Prospero::BufferFormat::k10_10_10_2SNorm, vk::Format::eA2B10G10R10SnormPack32},
     {Prospero::BufferFormat::k10_10_10_2UInt, vk::Format::eA2B10G10R10UintPack32},

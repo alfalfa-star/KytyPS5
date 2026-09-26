@@ -1,14 +1,18 @@
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 
 #include "common/assert.h"
+#include "common/perfTmp.h" // PERFTMP
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
+#include "graphics/shader/recompiler/ir/passes/SrtCompiler.h"
 
 #include <algorithm>
 #include <bit>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fmt/format.h>
+#include <optional>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -496,6 +500,15 @@ public:
 		return true;
 	}
 
+	// The address of a raw read whose current value only the GPU holds.
+	bool GpuOwnedRead(Value value, uint64_t& address) {
+		const auto* inst = value.Resolve().TryInstruction();
+		bool        zero = false;
+		return m_runtime.gpu_owned != nullptr && inst != nullptr && IsRawRead(m_program, *inst) &&
+		       RawReadAddress(*inst, address, zero) && !zero &&
+		       m_runtime.gpu_owned(m_runtime.userdata, address);
+	}
+
 private:
 	static float Float32(uint64_t bits) {
 		return std::bit_cast<float>(static_cast<uint32_t>(bits));
@@ -595,6 +608,30 @@ private:
 	}
 
 	bool EvaluateRawRead(const Inst& inst, uint64_t& result) {
+		uint64_t address = 0;
+		bool     zero    = false;
+		if (!RawReadAddress(inst, address, zero)) {
+			return false;
+		}
+		if (zero) {
+			result = 0;
+			return true;
+		}
+		uint32_t word = 0;
+		if (m_runtime.read_memory != nullptr) {
+			if (!m_runtime.read_memory(m_runtime.userdata, address, &word)) {
+				return false;
+			}
+		} else {
+			std::memcpy(&word, reinterpret_cast<const void*>(address), sizeof(word));
+		}
+		result = word;
+		return true;
+	}
+
+	// The dword address a raw read loads; zero when it reads past a buffer and returns zero.
+	bool RawReadAddress(const Inst& inst, uint64_t& address, bool& zero) {
+		zero             = false;
 		const auto flags = inst.Flags<MemoryFlags>();
 		if (flags.index >= m_program.memory_info.size()) {
 			return false;
@@ -612,7 +649,6 @@ private:
 		}
 		const auto base      = ((high << 32u) | static_cast<uint32_t>(low)) & AddressMask;
 		const auto immediate = static_cast<int64_t>(static_cast<int32_t>(mem.offset));
-		uint64_t   address   = 0;
 		if (inst.GetOpcode() == ValueOpcode::ReadConstBuffer) {
 			uint64_t records = 0;
 			uint64_t word3   = 0;
@@ -631,7 +667,7 @@ private:
 			                      : static_cast<uint64_t>(stride) * static_cast<uint32_t>(records);
 			if (aligned > size || size - aligned < sizeof(uint32_t)) {
 				// S_BUFFER_LOAD past NumRecords returns zero.
-				result = 0;
+				zero = true;
 				return true;
 			}
 			address = ((base & ~uint64_t {3}) + byte_offset) & ~uint64_t {3};
@@ -642,15 +678,6 @@ private:
 				return false;
 			}
 		}
-		uint32_t word = 0;
-		if (m_runtime.read_memory != nullptr) {
-			if (!m_runtime.read_memory(m_runtime.userdata, address, &word)) {
-				return false;
-			}
-		} else {
-			std::memcpy(&word, reinterpret_cast<const void*>(address), sizeof(word));
-		}
-		result = word;
 		return true;
 	}
 
@@ -1005,11 +1032,13 @@ const DescriptorSource* Source(const ResourcePlan& program, uint32_t source) {
 	return &program.descriptor_sources[source];
 }
 
-bool EvaluateRuntimeSourcesImpl(const ResourcePlan& program, std::span<const uint32_t> sources,
-                                const SrtRuntime& runtime, std::vector<DescriptorValue>& results,
-                                std::vector<uint32_t>& flat, bool evaluate_flat,
-                                std::span<const uint8_t> clean_flat_slots,
-                                std::vector<uint8_t>&    active_sources) {
+bool EvaluateRuntimeSourcesInterpreted(const ResourcePlan&       program,
+                                       std::span<const uint32_t> sources, const SrtRuntime& runtime,
+                                       std::vector<DescriptorValue>& results,
+                                       std::vector<uint32_t>& flat, bool evaluate_flat,
+                                       std::span<const uint8_t>  clean_flat_slots,
+                                       std::vector<uint8_t>&     active_sources,
+                                       std::vector<GpuFlatRead>* gpu_flat_reads) {
 	if (!program.srt_plan_complete) {
 		return false;
 	}
@@ -1071,18 +1100,32 @@ bool EvaluateRuntimeSourcesImpl(const ResourcePlan& program, std::span<const uin
 		}
 		evaluated.push_back(value);
 	}
-	std::vector<uint32_t> flattened;
+	std::vector<uint32_t>    flattened;
+	std::vector<GpuFlatRead> gpu_reads;
 	if (evaluate_flat) {
 		flattened.resize(program.srt_reads.size());
 		for (const auto& read: program.srt_reads) {
 			const bool clean    = read.flat_offset < clean_flat_slots.size() &&
 			                      clean_flat_slots[read.flat_offset] != 0u;
 			auto&      selected = clean ? clean_evaluator : evaluator;
-			if (read.flat_offset >= flattened.size() ||
-			    !selected.Evaluate(read.value, flattened[read.flat_offset])) {
+			if (read.flat_offset >= flattened.size()) {
+				return false;
+			}
+			// Only the shader consumes a word no descriptor depends on; let the GPU copy it
+			// rather than wait for the GPU to finish writing it.
+			uint64_t address = 0;
+			if (!clean && gpu_flat_reads != nullptr &&
+			    evaluator.GpuOwnedRead(read.value, address)) {
+				gpu_reads.push_back({read.flat_offset, address});
+				continue;
+			}
+			if (!selected.Evaluate(read.value, flattened[read.flat_offset])) {
 				return false;
 			}
 		}
+	}
+	if (gpu_flat_reads != nullptr) {
+		*gpu_flat_reads = std::move(gpu_reads);
 	}
 	results        = std::move(evaluated);
 	active_sources = std::move(active);
@@ -1090,6 +1133,185 @@ bool EvaluateRuntimeSourcesImpl(const ResourcePlan& program, std::span<const uin
 		flat = std::move(flattened);
 	}
 	return true;
+}
+
+// EvaluateRuntimeSourcesInterpreted over the plan's compiled graph. Returns nullopt when the plan
+// has no compiled form that covers it.
+std::optional<bool> EvaluateRuntimeSourcesCompiled(
+    const ResourcePlan& program, std::span<const uint32_t> sources, const SrtRuntime& runtime,
+    std::vector<DescriptorValue>& results, std::vector<uint32_t>& flat, bool evaluate_flat,
+    std::span<const uint8_t> clean_flat_slots, std::vector<uint8_t>& active_sources,
+    std::vector<GpuFlatRead>* gpu_flat_reads) {
+	const auto* compiled = program.compiled_srt.get();
+	if (compiled == nullptr ||
+	    compiled->descriptor_source_slots.size() != program.descriptor_sources.size() ||
+	    compiled->srt_read_slots.size() != program.srt_reads.size() ||
+	    compiled->control_flow_condition_slots.size() != program.control_flow.size()) {
+		return std::nullopt;
+	}
+	if (!program.srt_plan_complete) {
+		return false;
+	}
+	if (std::ranges::any_of(clean_flat_slots, [](uint8_t clean) { return clean != 0u; }) &&
+	    runtime.read_specialization_memory == nullptr) {
+		return false;
+	}
+	const auto           clean_runtime = CleanRuntime(runtime);
+	CompiledSrtEvaluator clean_evaluator(*compiled, clean_runtime);
+	CompiledSrtEvaluator evaluator(*compiled, runtime, clean_flat_slots, &clean_evaluator);
+	const auto           evaluate = [](CompiledSrtEvaluator& from, uint32_t slot, uint32_t& out) {
+		uint64_t wide = 0;
+		if (!from.Evaluate(slot, wide)) {
+			return false;
+		}
+		out = static_cast<uint32_t>(wide);
+		return true;
+	};
+	std::vector<uint8_t> active;
+	if (evaluate_flat) {
+		active.assign(program.descriptor_sources.size(), 1u);
+	}
+	if (evaluate_flat && !program.control_flow.empty()) {
+		for (const auto& block: program.control_flow) {
+			for (const auto source: block.sources) {
+				active.at(source) = 0u;
+			}
+		}
+		std::vector<uint8_t>  visited(program.control_flow.size());
+		std::vector<uint32_t> pending {0};
+		while (!pending.empty()) {
+			const auto index = pending.back();
+			pending.pop_back();
+			if (visited.at(index)) {
+				continue;
+			}
+			visited[index]    = 1u;
+			const auto& block = program.control_flow[index];
+			for (const auto source: block.sources) {
+				active[source] = 1u;
+			}
+			uint32_t   condition      = 0;
+			const auto condition_slot = compiled->control_flow_condition_slots[index];
+			if (condition_slot != kInvalidSlot && runtime.read_specialization_memory != nullptr &&
+			    evaluate(clean_evaluator, condition_slot, condition)) {
+				pending.push_back(block.successors[condition != 0u ? 0u : 1u]);
+			} else {
+				pending.insert(pending.end(), block.successors.begin(), block.successors.end());
+			}
+		}
+	}
+	std::vector<DescriptorValue> evaluated;
+	evaluated.reserve(sources.size());
+	for (const auto source_index: sources) {
+		const auto* source = Source(program, source_index);
+		if (source == nullptr) {
+			return false;
+		}
+		DescriptorValue value;
+		value.dword_count = source->dword_count;
+		if (!evaluate_flat || active[source_index]) {
+			const auto& slots = compiled->descriptor_source_slots[source_index];
+			for (uint32_t index = 0; index < source->dword_count; index++) {
+				if (!evaluate(evaluator, slots[index], value.dwords[index])) {
+					return false;
+				}
+			}
+		}
+		evaluated.push_back(value);
+	}
+	std::vector<uint32_t>    flattened;
+	std::vector<GpuFlatRead> gpu_reads;
+	if (evaluate_flat) {
+		flattened.resize(program.srt_reads.size());
+		for (size_t i = 0; i < program.srt_reads.size(); i++) {
+			const auto& read     = program.srt_reads[i];
+			const auto  slot     = compiled->srt_read_slots[i];
+			const bool  clean    = read.flat_offset < clean_flat_slots.size() &&
+			                       clean_flat_slots[read.flat_offset] != 0u;
+			auto&       selected = clean ? clean_evaluator : evaluator;
+			if (read.flat_offset >= flattened.size()) {
+				return false;
+			}
+			uint64_t address = 0;
+			bool     zero    = false;
+			if (!clean && gpu_flat_reads != nullptr && runtime.gpu_owned != nullptr &&
+			    evaluator.RawReadAddress(slot, address, zero) && !zero &&
+			    runtime.gpu_owned(runtime.userdata, address)) {
+				gpu_reads.push_back({read.flat_offset, address});
+				continue;
+			}
+			if (!evaluate(selected, slot, flattened[read.flat_offset])) {
+				return false;
+			}
+		}
+	}
+	if (gpu_flat_reads != nullptr) {
+		*gpu_flat_reads = std::move(gpu_reads);
+	}
+	results        = std::move(evaluated);
+	active_sources = std::move(active);
+	if (evaluate_flat) {
+		flat = std::move(flattened);
+	}
+	return true;
+}
+
+// KYTY_SRT_SHADOW_VALIDATE=1 evaluates every plan both ways and exits on any difference.
+bool ShadowValidateSrt() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_SRT_SHADOW_VALIDATE");
+		return value != nullptr && value[0] != '\0' && value[0] != '0';
+	}();
+	return enabled;
+}
+
+bool EvaluateRuntimeSourcesImpl(const ResourcePlan& program, std::span<const uint32_t> sources,
+                                const SrtRuntime& runtime, std::vector<DescriptorValue>& results,
+                                std::vector<uint32_t>& flat, bool evaluate_flat,
+                                std::span<const uint8_t>  clean_flat_slots,
+                                std::vector<uint8_t>&     active_sources,
+                                std::vector<GpuFlatRead>* gpu_flat_reads) {
+	PERFTMP_SCOPE(__PRETTY_FUNCTION__); // PERFTMP
+	if (!ShadowValidateSrt()) {
+		if (const auto compiled = EvaluateRuntimeSourcesCompiled(
+		        program, sources, runtime, results, flat, evaluate_flat, clean_flat_slots,
+		        active_sources, gpu_flat_reads)) {
+			return *compiled;
+		}
+		return EvaluateRuntimeSourcesInterpreted(program, sources, runtime, results, flat,
+		                                         evaluate_flat, clean_flat_slots, active_sources,
+		                                         gpu_flat_reads);
+	}
+	std::vector<DescriptorValue> compiled_results;
+	std::vector<uint32_t>        compiled_flat;
+	std::vector<uint8_t>         compiled_active;
+	std::vector<GpuFlatRead>     compiled_gpu_reads;
+	const auto                   compiled = EvaluateRuntimeSourcesCompiled(
+	    program, sources, runtime, compiled_results, compiled_flat, evaluate_flat, clean_flat_slots,
+	    compiled_active, gpu_flat_reads != nullptr ? &compiled_gpu_reads : nullptr);
+	const bool interpreted =
+	    EvaluateRuntimeSourcesInterpreted(program, sources, runtime, results, flat, evaluate_flat,
+	                                      clean_flat_slots, active_sources, gpu_flat_reads);
+	if (!compiled.has_value()) {
+		return interpreted;
+	}
+	const auto same_gpu_reads = [&] {
+		if (gpu_flat_reads == nullptr) {
+			return true;
+		}
+		return std::ranges::equal(compiled_gpu_reads, *gpu_flat_reads,
+		                          [](const GpuFlatRead& a, const GpuFlatRead& b) {
+			                          return a.slot == b.slot && a.address == b.address;
+		                          });
+	};
+	if (*compiled != interpreted ||
+	    (interpreted && (compiled_results != results || compiled_active != active_sources ||
+	                     (evaluate_flat && compiled_flat != flat) || !same_gpu_reads()))) {
+		EXIT("compiled SRT evaluation differs from the interpreter: hash=0x%016" PRIx64
+		     " stage=%s compiled=%d interpreted=%d\n",
+		     program.shader_hash, StageName(program.stage), *compiled ? 1 : 0, interpreted ? 1 : 0);
+	}
+	return interpreted;
 }
 
 } // namespace
@@ -1137,15 +1359,17 @@ bool EvaluateDescriptorSources(const ResourcePlan& program, std::span<const uint
 	std::vector<uint32_t> ignored;
 	std::vector<uint8_t>  active;
 	return EvaluateRuntimeSourcesImpl(program, sources, runtime, results, ignored, false, {},
-	                                  active);
+	                                  active, nullptr);
 }
 
 bool EvaluateRuntimeSources(const ResourcePlan& program, std::span<const uint32_t> sources,
                             const SrtRuntime& runtime, std::vector<DescriptorValue>& results,
                             std::vector<uint32_t>& flat, std::span<const uint8_t> clean_flat_slots,
-                            std::vector<uint8_t>& active_sources) {
+                            std::vector<uint8_t>&     active_sources,
+                            std::vector<GpuFlatRead>* gpu_flat_reads) {
+	PERFTMP_SCOPE(__PRETTY_FUNCTION__); // PERFTMP
 	return EvaluateRuntimeSourcesImpl(program, sources, runtime, results, flat, true,
-	                                  clean_flat_slots, active_sources);
+	                                  clean_flat_slots, active_sources, gpu_flat_reads);
 }
 
 bool WalkSrt(const ResourcePlan& program, const SrtRuntime& runtime, std::vector<uint32_t>& flat) {

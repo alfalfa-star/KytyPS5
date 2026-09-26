@@ -91,6 +91,9 @@ void AllocateBindings(Program& program, uint32_t push_data_start_dword) {
 
 	std::array<std::vector<uint32_t>, ImageBindingCount> image_groups;
 	for (uint32_t i = 0; i < program.info.images.size(); i++) {
+		if (program.info.images[i].bindless) {
+			continue; // descriptor set 1, see Bindless
+		}
 		const auto kind = DescriptorBindingForImage(program.info.images[i]);
 		if (!kind.has_value()) {
 			EXIT("shader binding layout failed: image %u has an invalid binding class", i);

@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "common/perfTmp.h" // PERFTMP
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/presentation/videoOut.h"
 #include "libs/errno.h"
@@ -15,7 +16,8 @@ RenderContext::RenderContext(GraphicContext& graphics)
       m_descriptor_heap(graphics, m_command_scheduler.GetMasterSemaphore()),
       m_pipeline_cache(graphics), m_sampler_cache(graphics),
       m_buffer_cache(graphics, m_command_scheduler, m_page_manager, m_texture_cache),
-      m_texture_cache(graphics, m_command_scheduler, m_page_manager, m_buffer_cache) {
+      m_texture_cache(graphics, m_command_scheduler, m_page_manager, m_buffer_cache),
+      m_bindless_heap(graphics, m_command_scheduler) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 }
 
@@ -62,9 +64,15 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 		return false;
 	}
 	if (access == PageFaultAccess::Write) {
-		m_buffer_cache.InvalidateMemory(fault_vaddr, fault_size);
+		PERFTMP_SCOPE("write fault invalidate"); // PERFTMP
+		{
+			PERFTMP_SCOPE("write fault: buffer invalidate"); // PERFTMP
+			m_buffer_cache.InvalidateMemory(fault_vaddr, fault_size);
+		}
+		PERFTMP_SCOPE("write fault: texture invalidate"); // PERFTMP
 		m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);
 	} else {
+		PERFTMP_SCOPE("ReadMemory from read fault"); // PERFTMP
 		m_buffer_cache.ReadMemory(fault_vaddr, fault_size);
 	}
 	return true;

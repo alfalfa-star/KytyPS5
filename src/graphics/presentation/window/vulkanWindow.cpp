@@ -69,6 +69,13 @@ vk::PhysicalDeviceVulkan12Features WindowContext::RequiredVulkan12Features() noe
 	features.shaderOutputViewportIndex = VK_TRUE;
 	features.bufferDeviceAddress       = VK_TRUE;
 	features.shaderBufferInt64Atomics  = VK_TRUE;
+	// The bindless texture heap (descriptor set 1).
+	features.descriptorIndexing                           = VK_TRUE;
+	features.runtimeDescriptorArray                       = VK_TRUE;
+	features.shaderSampledImageArrayNonUniformIndexing    = VK_TRUE;
+	features.descriptorBindingPartiallyBound              = VK_TRUE;
+	features.descriptorBindingSampledImageUpdateAfterBind = VK_TRUE;
+	features.descriptorBindingUpdateUnusedWhilePending    = VK_TRUE;
 	return features;
 }
 
@@ -281,6 +288,15 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 		if (required_features12.bufferDeviceAddress == VK_TRUE &&
 		    features12.bufferDeviceAddress != VK_TRUE) {
 			LOGF("bufferDeviceAddress is not supported\n");
+			skip_device = true;
+		}
+		if (features12.descriptorIndexing != VK_TRUE ||
+		    features12.runtimeDescriptorArray != VK_TRUE ||
+		    features12.shaderSampledImageArrayNonUniformIndexing != VK_TRUE ||
+		    features12.descriptorBindingPartiallyBound != VK_TRUE ||
+		    features12.descriptorBindingSampledImageUpdateAfterBind != VK_TRUE ||
+		    features12.descriptorBindingUpdateUnusedWhilePending != VK_TRUE) {
+			LOGF("descriptor indexing for the bindless texture heap is not supported\n");
 			skip_device = true;
 		}
 		if (required_features12.shaderBufferInt64Atomics == VK_TRUE &&

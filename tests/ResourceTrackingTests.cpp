@@ -444,14 +444,16 @@ void TestInvariantIndirectImageMaterialization() {
         "rejected indirect table descriptor read mutated the snapshot");
   memory.fail_address = UINT64_MAX;
 
+  // A T# the host cannot reduce to a table (entry dwords at inconsistent offsets) is left to
+  // the GPU: the shader looks it up in the bindless heap.
   auto malformed = MakeIndirectImageFixture(true);
   BuildSrtPlan(malformed->program);
-  CheckFatal([&] { TrackResources(malformed->program); }, "not a valid runtime value",
-             "malformed indirect image pattern was accepted");
-  Check(!malformed->program.resource_tracking_complete &&
-            malformed->program.info.images.empty() &&
-            malformed->program.descriptor_sources.empty(),
-        "malformed indirect image pattern was partially accepted");
+  TrackResources(malformed->program);
+  Check(malformed->program.info.images.size() == 1 &&
+            malformed->program.info.images[0].bindless && malformed->program.info.uses_bindless,
+        "malformed indirect image pattern was not resolved through the bindless heap");
+  Check(malformed->program.resource_tracking_complete,
+        "bindless image tracking did not complete");
 
   // Demon's Souls keeps its bindless heap index at a fixed non-zero offset within the
   // material record, encoded purely as the S_BUFFER_LOAD immediate (no address-level add).

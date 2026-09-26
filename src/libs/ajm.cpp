@@ -10,6 +10,7 @@
 #include "libs/libs.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cerrno>
 #include <cstdint>
@@ -160,6 +161,32 @@ static const char* AjmCodecName(uint32_t codec) {
 
 static_assert(sizeof(AjmDecAt9ConfigDataInfo) == 20);
 
+// Frame layout of a sync-first ATRAC9 config word. Channel layouts LibAtrac9 does not know
+// report one channel.
+static int At9ConfigInfo(uint32_t word, AjmDecAt9ConfigDataInfo* config_info) {
+	static constexpr std::array<uint32_t, 16> SampleRates = {
+	    11025, 12000, 16000, 22050, 24000, 32000,  44100,  48000,
+	    44100, 48000, 64000, 88200, 96000, 128000, 176400, 192000};
+	static constexpr std::array<uint8_t, 16> FrameSamplesPower = {6, 6, 7, 7, 7, 8, 8, 8,
+	                                                              6, 6, 7, 7, 7, 8, 8, 8};
+	static constexpr std::array<uint32_t, 8> ChannelCounts     = {1, 2, 2, 6, 8, 4, 1, 1};
+
+	const uint32_t sample_rate_index = (word >> 20u) & 0xfu;
+	const uint32_t channel_index     = (word >> 17u) & 0x7u;
+	const uint32_t frame_bytes       = ((word >> 5u) & 0x7ffu) + 1u;
+	const uint32_t superframe_index  = (word >> 3u) & 0x3u;
+	if ((word >> 24u) != 0xFEu) {
+		return AJM_ERROR_INVALID_PARAMETER;
+	}
+	const uint32_t frame_samples                = 1u << FrameSamplesPower[sample_rate_index];
+	config_info->channels                       = ChannelCounts[channel_index];
+	config_info->sample_rate                    = SampleRates[sample_rate_index];
+	config_info->frame_samples_per_channel      = frame_samples;
+	config_info->superframe_samples_per_channel = frame_samples << superframe_index;
+	config_info->superframe_size                = frame_bytes << superframe_index;
+	return OK;
+}
+
 int KYTY_SYSV_ABI AjmDecAt9ParseConfigData(const void*              config_data,
                                            AjmDecAt9ConfigDataInfo* config_info) {
 	PRINT_NAME();
@@ -174,12 +201,35 @@ int KYTY_SYSV_ABI AjmDecAt9ParseConfigData(const void*              config_data,
 
 	uint8_t config[ATRAC9_CONFIG_DATA_SIZE] {};
 	std::memcpy(config, config_data, sizeof(config));
+	if (config[0] != 0xFE && config[3] == 0xFE) {
+		// Some streams hand over the config word with the sync byte last (Ghost of Yotei's
+		// 8-channel "cube" XVAGs); the library reads it most significant byte first. Report its
+		// layout without initializing LibAtrac9, which cannot decode these multichannel streams.
+		const uint32_t word = (static_cast<uint32_t>(config[3]) << 24u) |
+		                      (static_cast<uint32_t>(config[2]) << 16u) |
+		                      (static_cast<uint32_t>(config[1]) << 8u) | config[0];
+		return At9ConfigInfo(word, config_info);
+	}
+	if (config[0] == 0xFE && ((config[1] >> 1u) & 7u) >= 6u) {
+		// PS5 channel layouts past LibAtrac9's table (e.g. index 7) cannot be decoded here; report
+		// their frame layout so callers size their buffers, and let the stream play silent.
+		const uint32_t word = (static_cast<uint32_t>(config[0]) << 24u) |
+		                      (static_cast<uint32_t>(config[1]) << 16u) |
+		                      (static_cast<uint32_t>(config[2]) << 8u) | config[3];
+		return At9ConfigInfo(word, config_info);
+	}
 	Atrac9CodecInfo codec_info {};
 	const int       init_result = Atrac9InitDecoder(handle, config);
 	const int       info_result =
 	    init_result == 0 ? Atrac9GetCodecInfo(handle, &codec_info) : init_result;
 	Atrac9ReleaseHandle(handle);
 
+	std::fprintf(
+	    stderr,
+	    "PERFTMP at9cfg caller=%p bytes=%02x %02x %02x %02x result=%d ch=%d sr=%d fs=%d sf=%d\n",
+	    __builtin_return_address(0), config[0], config[1], config[2], config[3], info_result,
+	    codec_info.channels, codec_info.samplingRate, codec_info.frameSamples,
+	    codec_info.superframeSize); // PERFTMP
 	if (info_result != 0 || codec_info.channels <= 0 || codec_info.samplingRate <= 0 ||
 	    codec_info.frameSamples <= 0 || codec_info.framesInSuperframe <= 0 ||
 	    codec_info.superframeSize <= 0) {

@@ -4,6 +4,7 @@
 #include "common/common.h"
 #include "common/file.h"
 #include "common/logging/log.h"
+#include "common/perfTmp.h" // PERFTMP
 #include "common/profiler.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
@@ -1067,6 +1068,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
                                          vk::PrimitiveTopology topology, const DrawEmitInfo& emit,
                                          const DrawIndexBufferSource& index_source,
                                          bool                         primitive_restart_enable) {
+	PERFTMP_SCOPE(__PRETTY_FUNCTION__); // PERFTMP
 	auto&      ucfg = buffer.GetUserConfig();
 	const auto vertex_stages =
 	    std::span {state.vertex_info.data(), state.programs.VertexStageCount()};
@@ -1150,6 +1152,38 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (bindings.pixel && !draw.IsIndexed()) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x300u);
 	}
+	{ // PERFTMP: KYTY_SKIP_PS=<hex hash> drops draws with that pixel shader
+		static const uint64_t skip = [] {
+			const char* v = std::getenv("KYTY_SKIP_PS");
+			return v != nullptr ? std::strtoull(v, nullptr, 16) : 0ull;
+		}();
+		if (skip != 0 && bindings.pixel && bindings.pixel->runtime->program->shader_hash == skip) {
+			return;
+		}
+		if (PerfTmp::TraceFrame() && bindings.pixel &&
+		    (bindings.pixel->runtime->program->shader_hash & 0xffffffffull) == 0x1563e824ull) {
+			const auto& regs = buffer.GetRegisters();
+			const auto& bc   = regs.GetBlendControl(0);
+			const auto& bcol = regs.GetBlendColor();
+			std::fprintf(stderr,
+			             "TRACE overlay cc_mode=%u cc_op=%02x blend=%d src=%u dst=%u comb=%u "
+			             "asrc=%u adst=%u sep=%d const=%f,%f,%f,%f rtmask=%08x bypass=%d\n",
+			             regs.GetColorControl().mode, regs.GetColorControl().op, bc.enable,
+			             bc.color_srcblend, bc.color_destblend, bc.color_comb_fcn,
+			             bc.alpha_srcblend, bc.alpha_destblend, bc.separate_alpha_blend, bcol.red,
+			             bcol.green, bcol.blue, bcol.alpha, regs.GetRenderTargetMask(),
+			             regs.GetRenderTarget(0).info.blend_bypass);
+		}
+	}
+	if (PerfTmp::TraceFrame()) { // PERFTMP
+		for (uint32_t i = 0; i < state.color_count; i++) {
+			const auto& info = state.color_info[i].desc.info;
+			std::fprintf(stderr, "TRACE draw rt%u addr=%016llx fmt=%u %ux%u\n", i,
+			             static_cast<unsigned long long>(info.data.address),
+			             static_cast<unsigned>(info.guest_format), info.extent.width,
+			             info.extent.height);
+		}
+	}
 	CommitBindings(buffer, vk::PipelineBindPoint::eGraphics, pipeline, stages);
 	if (mesh_active) {
 		const uint32_t draw_data[] {draw.index_count,
@@ -1223,6 +1257,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 
 void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
                                const DrawIndexArgs& args) {
+	PERFTMP_SCOPE(__PRETTY_FUNCTION__); // PERFTMP
 	KYTY_PROFILER_FUNCTION();
 
 	EXIT_IF(buffer.IsInvalid());
@@ -1331,6 +1366,7 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
 void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const DrawAutoArgs& args) {
+	PERFTMP_SCOPE(__PRETTY_FUNCTION__); // PERFTMP
 	KYTY_PROFILER_FUNCTION();
 
 	EXIT_IF(buffer.IsInvalid());

@@ -323,6 +323,7 @@ static int KYTY_SYSV_ABI PsmlValidateObject(const void* object) {
 } // namespace Psml
 
 LIB_DEFINE(InitPsml_1) {
+	PRINT_NAME_ENABLE(true); // PERFTMP
 	LIB_FUNC("3WVD91e12ZQ", Psml::PsmlInitialize);
 	LIB_FUNC("+2KpvixvL6E", Psml::PsmlGetMainMemoryRequirements);
 	LIB_FUNC("eWoKNeB6V-k", Psml::PsmlSharedResourcesInitialize);

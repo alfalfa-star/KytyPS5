@@ -5,6 +5,7 @@
 #include "common/common.h"
 #include "common/file.h"
 #include "common/logging/log.h"
+#include "common/perfTmp.h" // PERFTMP
 #include "common/profiler.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
@@ -34,6 +35,7 @@
 #include <bit>
 #include <fmt/format.h>
 #include <limits>
+#include <set> // PERFTMP
 #include <span>
 #include <vector>
 
@@ -599,8 +601,18 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		     descriptor.fields[2], descriptor.fields[3], descriptor.fields[4], descriptor.fields[5],
 		     descriptor.fields[6], descriptor.fields[7]);
 	}
-	const auto depth        = static_cast<uint32_t>(descriptor.Depth()) + 1u;
-	const auto format       = descriptor.Format();
+	const auto depth  = static_cast<uint32_t>(descriptor.Depth()) + 1u;
+	const auto format = descriptor.Format();
+	if (address >= 0x5065bd0000ull && address < 0x5065bd0000ull + 0x2000000ull) { // PERFTMP
+		static std::set<std::pair<uint64_t, uint32_t>> seen;
+		if (seen.insert(
+		            {address, static_cast<uint32_t>(format) | (resource.written ? 0x10000u : 0u)})
+		        .second) {
+			std::fprintf(stderr, "PERFTMP tex11 fmt=%u addr=%016llx %ux%u storage=%d\n",
+			             (unsigned)format, (unsigned long long)address, width, height,
+			             (int)resource.written);
+		}
+	}
 	const bool volume       = type == Prospero::ImageType::kColor3D;
 	const bool layered      = type == Prospero::ImageType::kColor1DArray ||
 	                          type == Prospero::ImageType::kColor2DArray ||
@@ -775,6 +787,35 @@ static vk::DescriptorBufferInfo NativeUpload(RenderContext&            context,
 	return {buffer.Handle(), offset, data.size_bytes()};
 }
 
+// Fills flattened SRT words the GPU last wrote by copying them on the GPU from the buffers that
+// hold them, in submission order, so binding never waits for the GPU to finish writing them.
+static void CopyGpuFlatReads(RenderContext& context, const vk::DescriptorBufferInfo& flat,
+                             std::span<const ShaderRecompiler::IR::GpuFlatRead> reads) {
+	auto& scheduler = context.GetCommandScheduler();
+	scheduler.EndRendering();
+	const auto vk_buffer = scheduler.Current().Handle();
+
+	vk::MemoryBarrier before {};
+	before.srcAccessMask = vk::AccessFlagBits::eMemoryWrite;
+	before.dstAccessMask = vk::AccessFlagBits::eTransferRead;
+	vk_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+	                          vk::PipelineStageFlagBits::eTransfer, {}, 1, &before, 0, nullptr, 0,
+	                          nullptr);
+	for (const auto& read: reads) {
+		auto [source, source_offset] =
+		    context.GetBufferCache().ObtainBuffer(read.address, sizeof(uint32_t), false);
+		const vk::BufferCopy copy {source_offset, flat.offset + read.slot * sizeof(uint32_t),
+		                           sizeof(uint32_t)};
+		vk_buffer.copyBuffer(source->Handle(), flat.buffer, 1, &copy);
+	}
+	vk::MemoryBarrier after {};
+	after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+	after.dstAccessMask = vk::AccessFlagBits::eMemoryRead;
+	vk_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+	                          vk::PipelineStageFlagBits::eAllCommands, {}, 1, &after, 0, nullptr, 0,
+	                          nullptr);
+}
+
 void RenderExecutor::BindImage(ImageId id, bool storage) {
 	auto& image = m_context.GetTextureCache().GetImage(id);
 	if (image.info.data.Empty()) {
@@ -803,11 +844,162 @@ void RenderExecutor::ResetBindings() {
 	m_bound_images.clear();
 }
 
+namespace {
+
+namespace Bindless = ShaderRecompiler::IR::Bindless;
+namespace Decoder  = ShaderRecompiler::Decoder;
+
+Decoder::ImageDimension BindlessDimension(uint32_t kind) {
+	switch (kind) {
+		case Bindless::KindImage2D: return Decoder::ImageDimension::Dim2D;
+		case Bindless::KindImage2DArray: return Decoder::ImageDimension::Dim2DArray;
+		case Bindless::KindImage3D: return Decoder::ImageDimension::Dim3D;
+		default: return Decoder::ImageDimension::Unknown;
+	}
+}
+
+// The bindless path samples float views without shader-side format conversion; anything else
+// (and anything malformed a shader may have loaded) stays on the null descriptor.
+bool BindlessTextureSupported(uint32_t kind, const ShaderTextureResource& descriptor) {
+	if (descriptor.IsNull() || descriptor.Base40() == 0) {
+		return false;
+	}
+	const auto format = descriptor.Format();
+	if (Prospero::SampledTextureNumericClass(format) != Prospero::TextureNumericClass::Float ||
+	    Prospero::RemapTextureFormat(format) != format ||
+	    descriptor.BaseLevel() > descriptor.LastLevel()) {
+		return false;
+	}
+	const auto type = TextureType(descriptor);
+	switch (kind) {
+		case Bindless::KindImage2D: return type == Prospero::ImageType::kColor2D;
+		case Bindless::KindImage2DArray:
+			return type == Prospero::ImageType::kColor2DArray ||
+			       type == Prospero::ImageType::kColor2D;
+		case Bindless::KindImage3D: return type == Prospero::ImageType::kColor3D;
+		default: return false;
+	}
+}
+
+} // namespace
+
+bool RenderExecutor::ResolveBindlessImage(const BindlessHeap::Key& key, ImageId& image,
+                                          vk::ImageView& view) {
+	ShaderRecompiler::IR::DescriptorValue value;
+	value.dword_count = 8u;
+	std::copy(key.dwords.begin(), key.dwords.end(), value.dwords.begin());
+	if (!BindlessTextureSupported(key.kind, DecodeNativeDescriptor<ShaderTextureResource>(value))) {
+		return false;
+	}
+	ShaderRecompiler::IR::ImageResource resource;
+	resource.resource_class = ShaderRecompiler::IR::ImageResourceClass::Sampled;
+	resource.numeric_class  = Prospero::TextureNumericClass::Float;
+	resource.dimension      = BindlessDimension(key.kind);
+	resource.read           = true;
+	// An r128 T# arrives with zero upper dwords.
+	resource.r128       = std::all_of(key.dwords.begin() + 4, key.dwords.end(),
+	                                  [](uint32_t dword) { return dword == 0u; });
+	auto  binding       = ResolveTexture(resource, value);
+	auto& texture_cache = m_context.GetTextureCache();
+	view                = texture_cache.FindTexture(binding.image_id, binding.desc);
+	image               = binding.image_id;
+	texture_cache.GetImage(image).usage.texture = true;
+	return view != nullptr;
+}
+
+void RenderExecutor::InitBindlessNullDescriptors() {
+	auto&                               heap          = m_context.GetBindlessHeap();
+	auto&                               texture_cache = m_context.GetTextureCache();
+	ShaderRecompiler::IR::ImageResource resource;
+	resource.resource_class = ShaderRecompiler::IR::ImageResourceClass::Sampled;
+	resource.numeric_class  = Prospero::TextureNumericClass::Float;
+	auto       desc         = NullTextureDesc(resource, TextureCache::BindingType::Texture);
+	const auto flat         = texture_cache.FindImage(desc);
+	heap.SetNullImage(Bindless::KindImage2D, texture_cache.FindTexture(flat, desc));
+	desc.view_info.type = vk::ImageViewType::e2DArray;
+	heap.SetNullImage(Bindless::KindImage2DArray, texture_cache.FindTexture(flat, desc));
+	auto volume             = NullTextureDesc(resource, TextureCache::BindingType::Texture);
+	volume.info.type        = Prospero::ImageType::kColor3D;
+	volume.view_info.type   = vk::ImageViewType::e3D;
+	const auto volume_image = texture_cache.FindImage(volume);
+	heap.SetNullImage(Bindless::KindImage3D, texture_cache.FindTexture(volume_image, volume));
+	heap.SetNullSampler(m_context.GetSamplerCache().GetSampler(ShaderSamplerResource {}));
+	heap.MarkNullDescriptorsReady();
+}
+
+void RenderExecutor::RegisterBindless(const BindlessHeap::Key& key) {
+	auto& heap = m_context.GetBindlessHeap();
+	if (key.kind == Bindless::KindSampler) {
+		ShaderRecompiler::IR::DescriptorValue value;
+		value.dword_count = 4u;
+		std::copy(key.dwords.begin(), key.dwords.begin() + 4, value.dwords.begin());
+		auto descriptor = DecodeNativeDescriptor<ShaderSamplerResource>(value);
+		descriptor.fields[0] &= ~(0x7u << 12u); // no depth compare through the heap
+		if (heap.RegisterSampler(key, m_context.GetSamplerCache().GetSampler(descriptor)) ==
+		    nullptr) {
+			heap.Reject(key);
+		}
+		return;
+	}
+	ImageId       image;
+	vk::ImageView view = nullptr;
+	if (BindlessDimension(key.kind) == ShaderRecompiler::Decoder::ImageDimension::Unknown ||
+	    !ResolveBindlessImage(key, image, view) ||
+	    heap.RegisterImage(key, image, view) == nullptr) {
+		heap.Reject(key);
+	}
+}
+
+void RenderExecutor::PrepareBindless() {
+	PERFTMP_SCOPE("PrepareBindless"); // PERFTMP
+	auto& heap = m_context.GetBindlessHeap();
+	if (!heap.HasNullDescriptors()) {
+		InitBindlessNullDescriptors();
+	}
+	for (const auto& key: heap.TakeMisses()) {
+		RegisterBindless(key);
+		std::fprintf(stderr, "PERFTMP bindless %s kind=%u %08x %08x %08x %08x\n", // PERFTMP
+		             heap.Find(key) != nullptr ? "registered" : "rejected", key.kind, key.dwords[0],
+		             key.dwords[1], key.dwords[2], key.dwords[3]);
+	}
+	// A CPU write untracks a texture and the cache may replace or free it; resolve again then.
+	auto& texture_cache = m_context.GetTextureCache();
+	heap.ForEachImage([&](const BindlessHeap::Key& key, BindlessHeap::Entry& entry) {
+		auto* image = texture_cache.m_slot_images.try_get(entry.image);
+		if (image != nullptr && image->registered &&
+		    std::ranges::find(image->views, entry.view, &CachedImageView::view) !=
+		        image->views.end()) {
+			return;
+		}
+		ImageId       replacement;
+		vk::ImageView view = nullptr;
+		if (ResolveBindlessImage(key, replacement, view)) {
+			heap.UpdateImage(entry, replacement, view);
+		}
+	});
+}
+
+void RenderExecutor::TransitBindless(vk::CommandBuffer command_buffer) {
+	auto& texture_cache = m_context.GetTextureCache();
+	m_context.GetBindlessHeap().ForEachImage(
+	    [&](const BindlessHeap::Key&, BindlessHeap::Entry& entry) {
+		    auto* image = texture_cache.m_slot_images.try_get(entry.image);
+		    if (image == nullptr || image->binding.is_target || image->info.data.Empty()) {
+			    return;
+		    }
+		    image->Transit(vk::ImageLayout::eGeneral, vk::AccessFlagBits2::eShaderRead, {},
+		                   command_buffer);
+	    });
+}
+
 PreparedBindings RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(!runtime);
-	const auto&      program  = *runtime.program;
-	const auto&      snapshot = runtime.resources;
+	const auto& program  = *runtime.program;
+	const auto& snapshot = runtime.resources;
+	if (program.info.uses_bindless) {
+		PrepareBindless();
+	}
 	PreparedBindings prepared;
 	prepared.runtime = &runtime;
 	prepared.images.reserve(program.info.images.size());
@@ -839,6 +1031,10 @@ void RenderExecutor::FindBuffers(PreparedBindings& prepared) {
 	const auto& snapshot = prepared.runtime->resources;
 	auto&       cache    = m_context.GetBufferCache();
 
+	// Flattened SRT words copied on the GPU are read from the buffers that hold them.
+	for (const auto& read: snapshot.gpu_flat_reads) {
+		(void)cache.FindBuffer(read.address, sizeof(uint32_t));
+	}
 	prepared.buffer_sources.clear();
 	prepared.buffer_sources.reserve(program.info.buffers.size());
 	for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
@@ -882,6 +1078,9 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 	if (ShaderRecompiler::IR::FindBinding(
 	        layout, ShaderRecompiler::IR::DescriptorBindingKind::FlattenedSrt) != nullptr) {
 		prepared.flattened_srt = NativeUpload(m_context, snapshot.flattened_srt);
+		if (!snapshot.gpu_flat_reads.empty()) {
+			CopyGpuFlatReads(m_context, prepared.flattened_srt, snapshot.gpu_flat_reads);
+		}
 	}
 	if (ShaderRecompiler::IR::FindBinding(
 	        program.bindings, ShaderRecompiler::IR::DescriptorBindingKind::ShaderData) != nullptr) {
@@ -1003,6 +1202,31 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 		         (shader_stage & GraphicsStages) == vk::ShaderStageFlags {}) ||
 		        (pipeline_bind_point == vk::PipelineBindPoint::eCompute &&
 		         shader_stage != vk::ShaderStageFlagBits::eCompute));
+	}
+	if (PerfTmp::TraceFrame()) { // PERFTMP
+		for (const auto* prepared: prepared_bindings) {
+			const auto& program = *prepared->runtime->program;
+			std::fprintf(stderr, "TRACE flip=%u %s hash=%016llx\n", PerfTmp::FlipCounter().load(),
+			             ShaderStageResourceName(program.stage),
+			             static_cast<unsigned long long>(program.shader_hash));
+			for (uint32_t i = 0; i < prepared->images.size(); i++) {
+				const auto& info = prepared->images[i].desc.info;
+				std::fprintf(
+				    stderr, "TRACE   img%u %s addr=%016llx fmt=%u %ux%ux%u%s\n", i,
+				    prepared->images[i].desc.type == TextureCache::BindingType::Storage ? "RW"
+				                                                                        : "R",
+				    static_cast<unsigned long long>(info.data.address),
+				    static_cast<unsigned>(info.guest_format), info.extent.width, info.extent.height,
+				    info.extent.depth, program.info.images[i].bindless ? " bindless" : "");
+			}
+		}
+	}
+	const bool uses_bindless =
+	    std::ranges::any_of(prepared_bindings, [](const PreparedBindings* prepared) {
+		    return prepared->runtime->program->info.uses_bindless;
+	    });
+	if (uses_bindless) {
+		TransitBindless(vk_buffer);
 	}
 	m_descriptor_buffers.clear();
 	m_descriptor_images.clear();
@@ -1152,6 +1376,9 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			m_descriptor_writes.push_back(write);
 		}
 		for (uint32_t i = 0; i < descriptors.images.size(); i++) {
+			if (program.info.images[i].bindless) {
+				continue;
+			}
 			const auto expected =
 			    descriptors.images[i].mip_views.empty()
 			        ? 1u
@@ -1191,6 +1418,11 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			vk_buffer.bindDescriptorSets(pipeline_bind_point, pipeline.pipeline_layout, 0, 1, &set,
 			                             0, nullptr);
 		}
+	}
+	if (uses_bindless) {
+		const auto set = m_context.GetBindlessHeap().Set();
+		vk_buffer.bindDescriptorSets(pipeline_bind_point, pipeline.pipeline_layout, Bindless::Set,
+		                             1, &set, 0, nullptr);
 	}
 }
 

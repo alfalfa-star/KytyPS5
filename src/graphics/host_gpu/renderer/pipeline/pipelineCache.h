@@ -134,9 +134,11 @@ public:
 	                    std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping,
 	                    bool pixel_active, std::array<ShaderVertexInputInfo, 3>& vertex_info,
 	                    ShaderPixelInputInfo& pixel_info);
+	// speculative: return an empty program for a shader not seen before or state that does not
+	// materialize, instead of compiling it or failing.
 	ShaderProgram GetComputeProgram(const HW::ComputeShaderInfo& regs,
 	                                const HW::ShaderRegisters&   sh,
-	                                ShaderComputeInputInfo&      input_info);
+	                                ShaderComputeInputInfo& input_info, bool speculative = false);
 
 	Pipeline& GetGraphicsPipeline(std::span<const RenderColorInfo>       colors,
 	                              const RenderDepthInfo&                 depth,

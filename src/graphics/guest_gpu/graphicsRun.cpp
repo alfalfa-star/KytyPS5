@@ -3,6 +3,7 @@
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
+#include "common/perfTmp.h" // PERFTMP
 #include "common/profiler.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
@@ -388,8 +389,7 @@ void CommandProcessor::WriteReferenceClock(uint64_t dst_address, uint32_t num_by
 	std::memcpy(reinterpret_cast<void*>(dst_address), &value, num_bytes);
 	static std::atomic<uint32_t> clock_log_count {0};
 	if (clock_log_count.fetch_add(1) < 64) {
-		LOGF("\t copy_data reference clock: dst=0x%016" PRIx64 " value=0x%016" PRIx64
-		     " size=%u\n",
+		LOGF("\t copy_data reference clock: dst=0x%016" PRIx64 " value=0x%016" PRIx64 " size=%u\n",
 		     dst_address, value, num_bytes);
 	}
 }
@@ -482,6 +482,7 @@ void GuestGpu::ThreadRun(void* data) {
 			while (gpu->m_commands.empty() && gpu->m_submission_count == 0 && !gpu->m_stopping) {
 				gpu->m_processing = false;
 				gpu->m_idle.Signal();
+				PERFTMP_SCOPE("gpu thread idle (no work)"); // PERFTMP
 				gpu->m_work_available.Wait(&gpu->m_queue_mutex);
 			}
 			if (gpu->m_stopping && gpu->m_commands.empty() && gpu->m_submission_count == 0) {
@@ -504,6 +505,7 @@ void GuestGpu::ThreadRun(void* data) {
 				}
 				if (selected_queue < 0) {
 					gpu->m_processing = false;
+					PERFTMP_SCOPE("gpu thread idle (queues blocked)"); // PERFTMP
 					gpu->m_work_available.WaitFor(&gpu->m_queue_mutex, 100);
 					for (auto& queue: gpu->m_queues) {
 						if (!queue.empty()) {
@@ -530,6 +532,7 @@ void GuestGpu::ThreadRun(void* data) {
 
 		if (command) {
 			EXIT_IF(g_current_processor != nullptr);
+			PERFTMP_SCOPE("gpu thread SendCommand task"); // PERFTMP
 			command();
 
 			Common::LockGuard lock(gpu->m_queue_mutex);
@@ -541,7 +544,11 @@ void GuestGpu::ThreadRun(void* data) {
 		}
 
 		EXIT_IF(!has_submission);
-		const bool complete = gpu->Process(submission);
+		bool complete = false;
+		{
+			PERFTMP_SCOPE("gpu thread Process submission"); // PERFTMP
+			complete = gpu->Process(submission);
+		}
 
 		Common::LockGuard lock(gpu->m_queue_mutex);
 		if (!complete) {
@@ -564,7 +571,7 @@ void GuestGpu::ThreadRun(void* data) {
 
 bool GuestGpu::Process(Submission& submission) {
 	const bool first_slice = !submission.started;
-	auto& cp = GetProcessor(submission.queue_id);
+	auto&      cp          = GetProcessor(submission.queue_id);
 
 	if (first_slice && submission.reset_processor) {
 		cp.Reset();
@@ -826,14 +833,12 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t 
 	uint64_t value = 0;
 
 	switch (op) {
-		case 0x00:
-			m_predicate_skip = false;
-			return;
+		case 0x00: m_predicate_skip = false; return;
 		case 0x01: {
 			EXIT_NOT_IMPLEMENTED(address == nullptr);
 			// One begin/end pair per DB; bit 63 marks each counter ready.
 			constexpr uint64_t ready_bit = 1ull << 63u;
-			const auto* results = reinterpret_cast<const volatile uint64_t*>(address);
+			const auto*        results   = reinterpret_cast<const volatile uint64_t*>(address);
 			for (uint32_t db = 0; db < 16u; db++) {
 				const auto begin = results[db * 2u];
 				const auto end   = results[db * 2u + 1u];
@@ -867,8 +872,8 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t 
 		if (log_count.fetch_add(1) < 128) {
 			LOGF("\t bool predication: addr=0x%016" PRIx64 ", value=0x%016" PRIx64
 			     ", condition=%" PRIu32 ", skip=%u, wait_op=%" PRIu32 "\n",
-			     reinterpret_cast<uint64_t>(address), value, condition,
-			     m_predicate_skip ? 1u : 0u, wait_op);
+			     reinterpret_cast<uint64_t>(address), value, condition, m_predicate_skip ? 1u : 0u,
+			     wait_op);
 		}
 	}
 }
@@ -885,6 +890,7 @@ void CommandProcessor::DrawIndex(DrawIndexArgs args) {
 		     args.base_vertex, args.first_instance);
 	}
 	m_renderer.GetRenderExecutor().DrawIndex(m_submit_id, CurrentBuffer(), args);
+	GetScheduler().CompleteOperation();
 }
 
 void CommandProcessor::DrawIndexOffset(uint32_t index_offset, uint32_t index_count) {
@@ -1108,6 +1114,7 @@ void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_g
 		// local_z        = std::max(cs.num_thread_z, 1u);
 		m_renderer.GetRenderExecutor().DispatchDirect(m_submit_id, CurrentBuffer(), thread_group_x,
 		                                              thread_group_y, thread_group_z, mode);
+		GetScheduler().CompleteOperation();
 	}
 
 	/*constexpr uint32_t DispatchInitiatorUseThreadDimensions = 1u << 5u;
@@ -1134,17 +1141,34 @@ void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_g
 }
 
 void CommandProcessor::DispatchIndirect(uint32_t data_offset, uint32_t mode) {
+	EXIT_NOT_IMPLEMENTED(m_dispatch_indirect_args_base_addr == 0);
+
+	DispatchIndirectAt(m_dispatch_indirect_args_base_addr + data_offset, mode);
+}
+
+void CommandProcessor::DispatchIndirectAt(uint64_t args_address, uint32_t mode) {
 	struct DispatchIndirectArgs {
 		uint32_t thread_group_x;
 		uint32_t thread_group_y;
 		uint32_t thread_group_z;
 	};
 
-	EXIT_NOT_IMPLEMENTED(m_dispatch_indirect_args_base_addr == 0);
+	EXIT_NOT_IMPLEMENTED(args_address == 0);
 
-	const auto args_addr = m_dispatch_indirect_args_base_addr + data_offset;
-	auto*      args      = reinterpret_cast<const DispatchIndirectArgs*>(args_addr);
+	// Counts an earlier GPU pass wrote would take a full GPU drain to read here; let the host
+	// GPU read them instead when the dispatch does not need them on the CPU.
+	if ((args_address & 3u) == 0u &&
+	    m_renderer.GetBufferCache().HasGpuDirtyBytes(args_address, sizeof(DispatchIndirectArgs))) {
+		m_sh_ctx.SetCsWaveSize(Pm4::ComputeWaveSize(mode));
+		CheckBuffer();
+		if (m_renderer.GetRenderExecutor().DispatchIndirect(m_submit_id, CurrentBuffer(),
+		                                                    args_address, mode)) {
+			GetScheduler().CompleteOperation();
+			return;
+		}
+	}
 
+	const auto* args = reinterpret_cast<const DispatchIndirectArgs*>(args_address);
 	DispatchDirect(args->thread_group_x, args->thread_group_y, args->thread_group_z, mode);
 }
 
@@ -1155,6 +1179,7 @@ void CommandProcessor::DrawIndexAuto(DrawAutoArgs args) {
 		args.instance_count = m_num_instances;
 	}
 	m_renderer.GetRenderExecutor().DrawAuto(m_submit_id, CurrentBuffer(), args);
+	GetScheduler().CompleteOperation();
 }
 
 void CommandProcessor::WaitFlipDone(uint32_t video_out_handle, uint32_t display_buffer_index) {

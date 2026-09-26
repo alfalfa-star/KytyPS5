@@ -455,9 +455,12 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	const vk::PushConstantRange push_constants {graphics_stages, 0,
 	                                            ShaderRecompiler::IR::NativePushConstantSize};
 
-	vk::PipelineLayoutCreateInfo pipeline_layout_info {};
-	pipeline_layout_info.setLayoutCount         = 1;
-	pipeline_layout_info.pSetLayouts            = &pipeline.descriptor_set_layout;
+	// Set 1 is the bindless heap; every layout carries it so heap shaders bind it the same way.
+	const std::array<vk::DescriptorSetLayout, 2> set_layouts {pipeline.descriptor_set_layout,
+	                                                          graphics.bindless_set_layout};
+	vk::PipelineLayoutCreateInfo                 pipeline_layout_info {};
+	pipeline_layout_info.setLayoutCount         = graphics.bindless_set_layout ? 2u : 1u;
+	pipeline_layout_info.pSetLayouts            = set_layouts.data();
 	pipeline_layout_info.pushConstantRangeCount = 1;
 	pipeline_layout_info.pPushConstantRanges    = &push_constants;
 
@@ -589,9 +592,12 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	const vk::PushConstantRange push_constants {vk::ShaderStageFlagBits::eCompute, 0,
 	                                            ShaderRecompiler::IR::NativePushConstantSize};
 
-	vk::PipelineLayoutCreateInfo pipeline_layout_info {};
-	pipeline_layout_info.setLayoutCount         = 1;
-	pipeline_layout_info.pSetLayouts            = &pipeline.descriptor_set_layout;
+	// Set 1 is the bindless heap; every layout carries it so heap shaders bind it the same way.
+	const std::array<vk::DescriptorSetLayout, 2> set_layouts {pipeline.descriptor_set_layout,
+	                                                          graphics.bindless_set_layout};
+	vk::PipelineLayoutCreateInfo                 pipeline_layout_info {};
+	pipeline_layout_info.setLayoutCount         = graphics.bindless_set_layout ? 2u : 1u;
+	pipeline_layout_info.pSetLayouts            = set_layouts.data();
 	pipeline_layout_info.pushConstantRangeCount = 1;
 	pipeline_layout_info.pPushConstantRanges    = &push_constants;
 

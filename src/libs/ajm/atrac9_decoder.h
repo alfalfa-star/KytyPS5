@@ -5,9 +5,11 @@
 #include "libs/ajm/decoder.h"
 
 #include <algorithm>
+#include <array>
 #include <cinttypes>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <limits>
 #include <vector>
@@ -120,6 +122,14 @@ public:
 		}
 
 		if (!m_is_initialized) {
+			static int logged = 0; // PERFTMP
+			if (logged++ < 30) {
+				std::fprintf(stderr,
+				             "PERFTMP ajm decode uninitialized cfg=%02x %02x %02x %02x input=%zu "
+				             "output=%zu\n",
+				             m_config_data[0], m_config_data[1], m_config_data[2], m_config_data[3],
+				             input_size, output_size);
+			}
 			result.result = AJM_RESULT_NOT_INITIALIZED;
 			return result;
 		}
@@ -187,6 +197,18 @@ public:
 
 		result.total_decoded_samples = m_total_decoded_samples;
 		result.format                = GetFormat();
+		if (m_silent) { // PERFTMP
+			static uint32_t calls = 0;
+			if ((calls++ % 200u) == 0u) {
+				std::fprintf(stderr,
+				             "PERFTMP silent decode calls=%u cfg=%02x%02x in=%zu consumed=%zu "
+				             "written=%zu frames=%u result=%x total=%llu\n",
+				             calls, m_config_data[0], m_config_data[1], input_size,
+				             result.input_consumed, result.output_written, result.frames,
+				             result.result,
+				             static_cast<unsigned long long>(m_total_decoded_samples));
+			}
+		}
 		return result;
 	}
 
@@ -259,6 +281,58 @@ private:
 		       AjmBytesPerSample(m_sample_encoding);
 	}
 
+	// PS5 channel layouts LibAtrac9 cannot decode: channel config indices 6 and 7, and the
+	// multichannel config Ghost of Yotei's movies and "cube" sounds use (sync byte last, e.g.
+	// 30 72 c0 fe for 12 channels), whose superframes carry 1024 samples as 64 bytes per channel
+	// and frame. Their frames are consumed at the right size and decode to silence, so streams
+	// (and players waiting on their audio clock) keep running.
+	bool InitializeSilentLayout() {
+		const auto* c             = m_config_data;
+		const auto  channels      = GetFormat().channel_num;
+		uint32_t    frame_bytes   = 0;
+		uint32_t    frames        = 0;
+		uint32_t    sample_rate   = 48000;
+		uint32_t    frame_samples = 256;
+		if (c[0] == 0xFEu && ((c[1] >> 1u) & 7u) >= 6u) {
+			static constexpr std::array<uint32_t, 16> SampleRates = {
+			    11025, 12000, 16000, 22050, 24000, 32000,  44100,  48000,
+			    44100, 48000, 64000, 88200, 96000, 128000, 176400, 192000};
+			static constexpr std::array<uint32_t, 16> FrameSamples = {
+			    64, 64, 128, 128, 128, 256, 256, 256, 64, 64, 128, 128, 128, 256, 256, 256};
+			const uint32_t word       = (uint32_t {c[0]} << 24u) | (uint32_t {c[1]} << 16u) |
+			                            (uint32_t {c[2]} << 8u) | c[3];
+			const auto     rate_index = (word >> 20u) & 0xfu;
+			sample_rate               = SampleRates[rate_index];
+			frame_samples             = FrameSamples[rate_index];
+			frame_bytes               = ((word >> 5u) & 0x7ffu) + 1u;
+			frames                    = 1u << ((word >> 3u) & 0x3u);
+		} else if (c[3] == 0xFEu && c[0] == 0x30u && (c[1] & 0xf0u) == 0x70u) {
+			frame_bytes = 64u * channels;
+			frames      = 4u;
+		} else {
+			return false;
+		}
+		if (channels == 0 || frame_bytes == 0) {
+			return false;
+		}
+		m_codec_info                    = {};
+		m_codec_info.channels           = static_cast<int>(channels);
+		m_codec_info.samplingRate       = static_cast<int>(sample_rate);
+		m_codec_info.frameSamples       = static_cast<int>(frame_samples);
+		m_codec_info.framesInSuperframe = static_cast<int>(frames);
+		m_codec_info.superframeSize     = static_cast<int>(frame_bytes * frames);
+		m_silent                        = true;
+		m_is_initialized                = true;
+		m_num_frames                    = 0;
+		m_total_decoded_samples         = 0;
+		m_superframe_bytes_remain       = static_cast<uint32_t>(m_codec_info.superframeSize);
+		SetFormat(channels, sample_rate, m_sample_encoding);
+		m_pcm_buffer.assign(FrameOutputBytes(), 0);
+		LOGF("AJM ATRAC9 layout %02x %02x %02x %02x is not decodable; playing %u ch silent\n", c[0],
+		     c[1], c[2], c[3], channels);
+		return true;
+	}
+
 	[[nodiscard]] uint32_t GetMinimumInputSize() const {
 		return (m_is_initialized ? m_superframe_bytes_remain : 0);
 	}
@@ -277,7 +351,14 @@ private:
 
 		std::memcpy(m_config_data, config_data, ATRAC9_CONFIG_DATA_SIZE);
 		m_has_config = true;
+		std::fprintf(stderr, "PERFTMP ajm at9 init cfg=%02x %02x %02x %02x ch=%u\n",
+		             m_config_data[0], m_config_data[1], m_config_data[2], m_config_data[3],
+		             GetFormat().channel_num); // PERFTMP
 
+		m_silent = false;
+		if (InitializeSilentLayout()) {
+			return true;
+		}
 		const int init_ret = Atrac9InitDecoder(m_handle, m_config_data);
 		if (init_ret != 0) {
 			m_is_initialized        = false;
@@ -312,6 +393,11 @@ private:
 	}
 
 	int DecodeFrame(const uint8_t* input, int* bytes_used) {
+		if (m_silent) {
+			std::fill(m_pcm_buffer.begin(), m_pcm_buffer.end(), uint8_t {0});
+			*bytes_used = m_codec_info.superframeSize / m_codec_info.framesInSuperframe;
+			return 0;
+		}
 		switch (m_sample_encoding) {
 			case AjmSampleEncoding::S16:
 				return Atrac9Decode(m_handle, input,
@@ -525,6 +611,7 @@ private:
 	uint32_t             m_superframe_bytes_remain = 0;
 	uint32_t             m_num_frames              = 0;
 	Atrac9CodecInfo      m_codec_info {};
+	bool                 m_silent = false;
 	std::vector<uint8_t> m_pcm_buffer;
 };
 

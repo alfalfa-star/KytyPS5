@@ -23,6 +23,7 @@
 #include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/logging/log.h"
+#include "common/perfTmp.h" // PERFTMP
 #include "common/profiler.h"
 #include "common/systemInfo.h"
 #include "common/threads.h"
@@ -210,11 +211,9 @@ static void ToggleDesktopFullscreen() {
 		return;
 	}
 
-	const auto flags = static_cast<uint32_t>(SDL_GetWindowFlags(g_window->window));
-	const bool fullscreen =
-	    (flags & static_cast<uint32_t>(SDL_WINDOW_FULLSCREEN_DESKTOP)) != 0u;
-	const auto mode =
-	    fullscreen ? 0u : static_cast<uint32_t>(SDL_WINDOW_FULLSCREEN_DESKTOP);
+	const auto flags      = static_cast<uint32_t>(SDL_GetWindowFlags(g_window->window));
+	const bool fullscreen = (flags & static_cast<uint32_t>(SDL_WINDOW_FULLSCREEN_DESKTOP)) != 0u;
+	const auto mode       = fullscreen ? 0u : static_cast<uint32_t>(SDL_WINDOW_FULLSCREEN_DESKTOP);
 	if (SDL_SetWindowFullscreen(g_window->window, mode) != 0) {
 		LOGF("Toggle fullscreen failed: %s\n", SDL_GetError());
 	}
@@ -360,8 +359,7 @@ static void GameEventController([[maybe_unused]] const EventController& f) {
 	if (f.axis) {
 		const auto axis = ControllerAxisFromSdl(f.axis_id);
 		if (axis != Controller::Axis::AxisMax) {
-			Controller::SetAxis(f.id, axis,
-			                    ControllerAxisValueFromSdl(f.axis_id, f.axis_value));
+			Controller::SetAxis(f.id, axis, ControllerAxisValueFromSdl(f.axis_id, f.axis_value));
 		}
 	}
 }
@@ -746,6 +744,7 @@ void WindowContext::ProcessEvent(double time_s) {
 }
 
 void WindowContext::RunOnMainThread(std::function<void()> task) {
+	PERFTMP_SCOPE(__PRETTY_FUNCTION__); // PERFTMP
 	if (Common::Thread::IsMainThread()) {
 		task();
 		return;
@@ -769,16 +768,36 @@ void WindowContext::RunOnMainThread(std::function<void()> task) {
 	}
 }
 
+void WindowContext::PostTitle(std::string text) {
+	bool wake = false;
+	{
+		Common::LockGuard lock(main_task_mutex);
+		wake          = !pending_title.has_value();
+		pending_title = std::move(text);
+	}
+	if (wake) {
+		SDL_Event event {};
+		event.type = SDL_USEREVENT;
+		SDL_PushEvent(&event);
+	}
+}
+
 void WindowContext::DrainMainThreadTasks() {
 	std::vector<std::function<void()>> tasks;
+	std::optional<std::string>         title;
 	{
 		Common::LockGuard lock(main_task_mutex);
 		tasks.swap(main_tasks);
+		title.swap(pending_title);
+	}
+	if (title.has_value() && window != nullptr) {
+		SDL_SetWindowTitle(window, title->c_str());
 	}
 	if (tasks.empty()) {
 		return;
 	}
 	for (auto& task: tasks) {
+		PERFTMP_SCOPE("DrainMainThreadTasks task"); // PERFTMP
 		task();
 	}
 	Common::LockGuard lock(main_task_mutex);
@@ -804,9 +823,15 @@ void WindowContext::Run() {
 			timer.Resume();
 		}
 
-		if (!HostInputWaitEvent(&loop.event)) {
+		bool got_event = false;
+		{
+			PERFTMP_SCOPE("HostInputWaitEvent"); // PERFTMP
+			got_event = HostInputWaitEvent(&loop.event);
+		}
+		if (!got_event) {
 			continue;
 		}
+		PERFTMP_SCOPE("ProcessEvent"); // PERFTMP
 		ProcessEvent(timer.GetTimeS());
 	}
 }
@@ -987,6 +1012,7 @@ void WindowContext::UpdateIcon() {
 }
 
 void WindowContext::UpdateTitle() {
+	PERFTMP_SCOPE(__PRETTY_FUNCTION__); // PERFTMP
 	static char title[128];
 	static char title_id[12];
 	static char app_ver[12];
@@ -996,10 +1022,10 @@ void WindowContext::UpdateTitle() {
 	static bool has_app_ver =
 	    Loader::SystemContentParamSfoGetString("APP_VER", app_ver, sizeof(app_ver));
 	static const std::string processor_name = Common::GetSystemInfo().ProcessorName;
-	static uint64_t fps_start   = Common::Timer::QueryPerformanceCounter();
-	static uint64_t frame_num   = 0;
-	static uint64_t fps_frames  = 0;
-	static double   current_fps = 0.0;
+	static uint64_t          fps_start      = Common::Timer::QueryPerformanceCounter();
+	static uint64_t          frame_num      = 0;
+	static uint64_t          fps_frames     = 0;
+	static double            current_fps    = 0.0;
 
 #if KYTY_BUILD == KYTY_BUILD_DEBUG
 	static constexpr auto build_type = "Debug";
@@ -1016,18 +1042,22 @@ void WindowContext::UpdateTitle() {
 	if (now - fps_start >= frequency) {
 		current_fps = static_cast<double>(fps_frames) * static_cast<double>(frequency) /
 		              static_cast<double>(now - fps_start);
-		fps_start   = now;
-		fps_frames  = 0;
+		PerfTmp::Dump(static_cast<double>(now - fps_start) /
+		              static_cast<double>(frequency)); // PERFTMP
+		fps_start  = now;
+		fps_frames = 0;
+		fprintf(stderr, "PERFTMP frame=%llu fps=%.1f\n", (unsigned long long)frame_num,
+		        current_fps); // PERFTMP
 	}
 
 	const auto* device_name = graphic_ctx.GetPhysicalDeviceProperties().deviceName.data();
-	auto text = fmt::format(
+	auto        text        = fmt::format(
 	    "[{} | {}] {}{}{}{}{}{}[{}] [{}], frame: {}, fps: {:.0f}", KYTY_BUILD_LABEL, build_type,
 	    (has_title ? title : ""), (has_title ? ", " : ""), (has_title_id ? title_id : ""),
 	    (has_title_id ? ", " : ""), (has_app_ver ? app_ver : ""), (has_app_ver ? " " : ""),
 	    device_name, processor_name, frame_num, current_fps);
 
-	RunOnMainThread([this, text = std::move(text)] { SDL_SetWindowTitle(window, text.c_str()); });
+	PostTitle(std::move(text));
 }
 
 } // namespace Libs::Graphics

@@ -145,9 +145,12 @@ struct ImageResource {
 	bool                          cube              = false;
 	bool                          r128              = false;
 	uint32_t                      indirect_root     = NoIndirectImage;
-	uint32_t                      indirect_mapping_offset    = 0;
-	uint32_t                      indirect_search_iterations = 0;
-	std::vector<uint32_t>         indirect_resources;
+	// The T# is only known on the GPU (e.g. read through a per-lane pointer): the shader looks
+	// it up in the global bindless heap instead of a per-draw binding. See Bindless below.
+	bool                  bindless                   = false;
+	uint32_t              indirect_mapping_offset    = 0;
+	uint32_t              indirect_search_iterations = 0;
+	std::vector<uint32_t> indirect_resources;
 
 	bool operator==(const ImageResource& other) const = default;
 };
@@ -157,6 +160,7 @@ struct SamplerResource {
 	uint32_t first_use_pc          = 0;
 	bool     force_point_filtering = false;
 	bool     depth_compare         = false;
+	bool     bindless              = false; // the S# is looked up in the bindless heap
 
 	bool operator==(const SamplerResource& other) const = default;
 };
@@ -414,6 +418,51 @@ DescriptorBindingForImage(const ImageResource& image) {
 	return static_cast<DescriptorBindingKind>(base + dimension);
 }
 
+// The global bindless heap (descriptor set 1, shared by every stage and pipeline). A shader finds
+// a runtime T#/S# in `table` (open addressing, BindlessProbes linear probes from BindlessHash)
+// and samples `images_*[slot]`. Slot 0 of every array holds a null descriptor; an unregistered
+// descriptor maps to it and is appended to `feedback` for the host to register.
+namespace Bindless {
+inline constexpr uint32_t Set              = 1u;
+inline constexpr uint32_t Images2D         = 0u;
+inline constexpr uint32_t Images2DArray    = 1u;
+inline constexpr uint32_t Images3D         = 2u;
+inline constexpr uint32_t Samplers         = 3u;
+inline constexpr uint32_t Table            = 4u;
+inline constexpr uint32_t Feedback         = 5u;
+inline constexpr uint32_t BindingCount     = 6u;
+inline constexpr uint32_t ImageSlots       = 16384u;
+inline constexpr uint32_t SamplerSlots     = 1024u;
+inline constexpr uint32_t TableEntries     = 32768u; // power of two
+inline constexpr uint32_t EntryWords       = 10u;    // kind, slot, 8 descriptor dwords
+inline constexpr uint32_t FeedbackEntries  = 1024u;
+inline constexpr uint32_t FeedbackWords    = 10u; // kind (written last), unused, 8 dwords
+inline constexpr uint32_t Probes           = 8u;
+inline constexpr uint32_t KindEmpty        = 0u;
+inline constexpr uint32_t KindImage2D      = 1u;
+inline constexpr uint32_t KindImage2DArray = 2u;
+inline constexpr uint32_t KindImage3D      = 3u;
+inline constexpr uint32_t KindSampler      = 4u;
+
+// Also evaluated in SPIR-V (EmitBindlessLookup); keep the two identical.
+[[nodiscard]] constexpr uint32_t Hash(uint32_t kind, const uint32_t* dwords) {
+	uint32_t hash = 0x811c9dc5u ^ kind;
+	for (uint32_t index = 0; index < 8u; index++) {
+		hash = (hash ^ dwords[index]) * 0x01000193u;
+	}
+	return (hash ^ (hash >> 15u)) & (TableEntries - 1u);
+}
+
+[[nodiscard]] constexpr std::optional<uint32_t> ImageKind(Decoder::ImageDimension dimension) {
+	switch (dimension) {
+		case Decoder::ImageDimension::Dim2D: return KindImage2D;
+		case Decoder::ImageDimension::Dim2DArray: return KindImage2DArray;
+		case Decoder::ImageDimension::Dim3D: return KindImage3D;
+		default: return std::nullopt;
+	}
+}
+} // namespace Bindless
+
 struct DescriptorBinding {
 	DescriptorBindingKind kind = DescriptorBindingKind::Buffers;
 	std::vector<uint32_t> resources;
@@ -458,6 +507,7 @@ struct ShaderInfo {
 	int32_t                          instance_offset_sgpr = -1;
 	bool                             has_bitwise_xor      = false;
 	bool                             uses_dma             = false;
+	bool                             uses_bindless        = false;
 
 	bool operator==(const ShaderInfo& other) const = default;
 };
@@ -555,6 +605,8 @@ struct UniformFillPlan {
 	std::array<Value, 4> values;
 };
 
+struct CompiledSrtProgram; // passes/SrtCompiler.h
+
 // Immutable runtime resource analysis retained by the shader cache. It owns descriptor/SRT,
 // uniform condition and fill values without retaining translated blocks.
 struct ResourcePlan {
@@ -582,6 +634,8 @@ struct ResourcePlan {
 	bool                          resource_tracking_complete     = false;
 	ShaderInfo                    info;
 	UniformFillPlan               uniform_fill;
+	// Flat form of the SRT graph above, built once the plan is final (ExtractResourcePlan).
+	std::shared_ptr<const CompiledSrtProgram> compiled_srt;
 };
 
 struct Program: ResourcePlan {

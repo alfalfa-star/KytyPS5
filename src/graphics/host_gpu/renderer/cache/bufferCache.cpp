@@ -3,6 +3,7 @@
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "common/perfTmp.h" // PERFTMP
 #include "common/profiler.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/graphicContext.h"
@@ -14,13 +15,25 @@
 #include "kernel/memory.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cinttypes>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <utility>
 #include <vector>
 
 namespace Libs::Graphics {
+
+namespace {
+
+int64_t NowMs() {
+	return std::chrono::duration_cast<std::chrono::milliseconds>(
+	           std::chrono::steady_clock::now().time_since_epoch())
+	    .count();
+}
+
+} // namespace
 
 namespace {
 
@@ -108,7 +121,8 @@ void BufferCache::DeleteBuffer(BufferId id) {
 	}
 }
 
-bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size) {
+bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size,
+                                       bool keep_dirty) {
 	std::vector<vk::BufferCopy> copies;
 	uint64_t                    total_size     = 0;
 	const auto                  buffer_address = buffer.CpuAddress();
@@ -121,7 +135,9 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 			    // Keep packed ranges on separate cache lines, as in shadPS4.
 			    total_size += Common::AlignUp(end - start, 64);
 		    });
-		    m_gpu_modified_ranges.Subtract(address, bytes);
+		    if (!keep_dirty) {
+			    m_gpu_modified_ranges.Subtract(address, bytes);
+		    }
 	    });
 	if (copies.empty()) {
 		return false;
@@ -194,6 +210,7 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 	    m_slot_buffers.insert(m_graphics, m_scheduler, MemoryUsage::DeviceLocal, 0, AllFlags, 16);
 	EXIT_IF(null_id != NULL_BUFFER_ID);
 	SetVulkanObjectNameF(m_graphics.device, GetBuffer(null_id).Handle(), "Kyty.NullBuffer");
+	m_scheduler.SetPreSubmitHook([this] { PrefetchReadbackPages(); });
 	if (!m_graphics.CanReportMemoryUsage()) {
 		return;
 	}
@@ -209,6 +226,7 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 }
 
 BufferCache::~BufferCache() {
+	m_scheduler.SetPreSubmitHook({});
 	if (!m_gpu_modified_ranges.Empty()) {
 		EXIT("BufferCache: destroyed with pending GPU-modified ranges\n");
 	}
@@ -231,6 +249,7 @@ void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 }
 
 void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
+	PERFTMP_SCOPE(__PRETTY_FUNCTION__); // PERFTMP
 	if (!GuestGpu::IsGpuThread() && CommandScheduler::InDeferredOperation()) {
 		EXIT("unsupported buffer readback from an asynchronous GPU completion, "
 		     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
@@ -239,6 +258,40 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 	m_scheduler.Context().GetGpu().SendCommandSync([this, vaddr, size, is_write] {
 		if (is_write && !IsRegionRegistered(vaddr, size)) {
 			return;
+		}
+		// A prefetched copy of this page may already be on its way; waiting for it does not
+		// need to submit and drain the current recording.
+		FinalizeReadbackPrefetches();
+		const auto page = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE);
+		if (vaddr + size <= page + TRACKER_PAGE_SIZE) {
+			const auto found = m_readback_pages.find(page);
+			if (found != m_readback_pages.end() && found->second.pending_tick != 0 &&
+			    !found->second.rewritten) {
+				PERFTMP_SCOPE("ReadMemory: wait for prefetch"); // PERFTMP
+				m_scheduler.Wait(found->second.pending_tick);
+				FinalizeReadbackPrefetches();
+			}
+			// PERFTMP: classify readbacks that still need a forced download
+			if (m_memory_tracker.IsRegionGpuModified(vaddr, size)) {
+				if (found == m_readback_pages.end()) {
+					PERFTMP_SCOPE("miss: page not hot"); // PERFTMP
+				} else if (found->second.pending_tick != 0) {
+					PERFTMP_SCOPE("miss: prefetch rewritten"); // PERFTMP
+				} else if (!HasGpuDirtyBytes(page, TRACKER_PAGE_SIZE)) {
+					PERFTMP_SCOPE("miss: hot page, tracker dirty without buffer ranges"); // PERFTMP
+				} else {
+					PERFTMP_SCOPE("miss: hot page never prefetched"); // PERFTMP
+				}
+			}
+			if (!m_memory_tracker.IsRegionGpuModified(vaddr, size)) {
+				if (found != m_readback_pages.end()) {
+					found->second.last_fault_ms = NowMs();
+				}
+				if (is_write) {
+					m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
+				}
+				return;
+			}
 		}
 		auto& buffer = m_slot_buffers[FindBuffer(vaddr, size)];
 
@@ -250,16 +303,156 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		const auto window_end =
 		    std::min(std::max(window_begin + WindowSize, vaddr + size), buffer_end);
 
-		if (DownloadBufferMemory(buffer, window_begin, window_end - window_begin)) {
+		// One staging download holds at most 32 MiB of dirty bytes, and an invalidated write can
+		// span far more than the read window, so drain large ranges in steps.
+		constexpr uint64_t ChunkSize  = 8ull * 1024 * 1024;
+		bool               downloaded = false;
+		for (auto begin = window_begin; begin < window_end; begin += ChunkSize) {
+			downloaded |=
+			    DownloadBufferMemory(buffer, begin, std::min(ChunkSize, window_end - begin));
+		}
+		const auto recent_pages = DownloadRecentReadbackPages(vaddr, window_begin, window_end);
+		downloaded |= !recent_pages.empty();
+		if (downloaded) {
+			PERFTMP_SCOPE("ReadMemory downloaded wait"); // PERFTMP
 			const auto tick = m_scheduler.CurrentTick();
 			m_scheduler.Wait(tick);
 			m_scheduler.WaitPriorityOperations(tick);
 			m_memory_tracker.UnmarkRegionAsGpuModified(window_begin, window_end - window_begin);
+			for (const auto page: recent_pages) {
+				m_memory_tracker.UnmarkRegionAsGpuModified(page, TRACKER_PAGE_SIZE);
+			}
 		}
 		if (is_write) {
 			m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
 		}
 	});
+}
+
+std::vector<uint64_t> BufferCache::DownloadRecentReadbackPages(uint64_t vaddr,
+                                                               uint64_t window_begin,
+                                                               uint64_t window_end) {
+	// Prefetched pages stop faulting, so the lifetime is what keeps a page prefetched.
+	constexpr int64_t PageLifetimeMs = 30000;
+	constexpr size_t  MaxPages       = 2048;
+	static const bool disabled = std::getenv("KYTY_NO_READBACK_PREFETCH") != nullptr; // PERFTMP
+	if (disabled) {
+		return {};
+	}
+	const auto now      = NowMs();
+	const auto faulting = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE);
+	if (auto found = m_readback_pages.find(faulting); found != m_readback_pages.end()) {
+		found->second.last_fault_ms = now;
+	} else if (m_readback_pages.size() < MaxPages) {
+		m_readback_pages.emplace(faulting, ReadbackPage {.last_fault_ms = now});
+	}
+	std::vector<uint64_t> pages;
+	for (auto it = m_readback_pages.begin(); it != m_readback_pages.end();) {
+		const auto page = it->first;
+		if (now - it->second.last_fault_ms > PageLifetimeMs && it->second.pending_tick == 0) {
+			it = m_readback_pages.erase(it);
+			continue;
+		}
+		++it;
+		if ((page >= window_begin && page < window_end) ||
+		    !m_memory_tracker.IsRegionGpuModified(page, TRACKER_PAGE_SIZE)) {
+			continue;
+		}
+		const auto* owner = m_page_table.Find(page >> PageTable::kPageBits);
+		if (owner == nullptr || !*owner) {
+			continue;
+		}
+		auto& owner_buffer = m_slot_buffers[*owner];
+		if (owner_buffer.IsInBounds(page, TRACKER_PAGE_SIZE) &&
+		    DownloadBufferMemory(owner_buffer, page, TRACKER_PAGE_SIZE)) {
+			pages.push_back(page);
+		}
+	}
+	return pages;
+}
+
+void BufferCache::MarkReadbackPagesWritten(uint64_t vaddr, uint64_t size) {
+	if (m_readback_pages.empty()) {
+		return;
+	}
+	const auto end = vaddr + size;
+	for (auto it = m_readback_pages.lower_bound(Common::AlignDown(vaddr, TRACKER_PAGE_SIZE));
+	     it != m_readback_pages.end() && it->first < end; ++it) {
+		if (!it->second.rewritten) {
+			it->second.rewritten = true;
+			m_rewritten_readback_pages.push_back(it->first);
+		}
+	}
+}
+
+void BufferCache::PrefetchReadbackPages() {
+	if (!GuestGpu::IsGpuThread() || !m_scheduler.Active() ||
+	    CommandScheduler::InDeferredOperation()) {
+		return;
+	}
+	PERFTMP_SCOPE("PrefetchReadbackPages");                    // PERFTMP
+	if (std::getenv("KYTY_NO_READBACK_PREFETCH") != nullptr) { // PERFTMP
+		return;
+	}
+	FinalizeReadbackPrefetches();
+	if (m_rewritten_readback_pages.empty()) {
+		return;
+	}
+	const auto tick = m_scheduler.CurrentTick();
+	for (const auto page: m_rewritten_readback_pages) {
+		const auto found = m_readback_pages.find(page);
+		if (found == m_readback_pages.end() || !found->second.rewritten) {
+			continue;
+		}
+		found->second.rewritten = false;
+		if (!m_memory_tracker.IsRegionGpuModified(page, TRACKER_PAGE_SIZE)) {
+			continue;
+		}
+		const auto* owner = m_page_table.Find(page >> PageTable::kPageBits);
+		if (owner == nullptr || !*owner) {
+			continue;
+		}
+		auto& owner_buffer = m_slot_buffers[*owner];
+		if (!owner_buffer.IsInBounds(page, TRACKER_PAGE_SIZE) ||
+		    !DownloadBufferMemory(owner_buffer, page, TRACKER_PAGE_SIZE, true)) {
+			continue;
+		}
+		if (found->second.pending_tick == 0) {
+			m_pending_readback_pages.push_back(page);
+		}
+		found->second.pending_tick = tick;
+	}
+	m_rewritten_readback_pages.clear();
+}
+
+void BufferCache::FinalizeReadbackPrefetches() {
+	if (m_pending_readback_pages.empty()) {
+		return;
+	}
+	auto& master = m_scheduler.GetMasterSemaphore();
+	master.Refresh();
+	for (size_t i = 0; i < m_pending_readback_pages.size();) {
+		const auto page  = m_pending_readback_pages[i];
+		const auto found = m_readback_pages.find(page);
+		if (found == m_readback_pages.end() || found->second.pending_tick == 0) {
+			m_pending_readback_pages[i] = m_pending_readback_pages.back();
+			m_pending_readback_pages.pop_back();
+			continue;
+		}
+		// A write recorded after the prefetch makes its copy stale; the next prefetch replaces it.
+		const auto tick = found->second.pending_tick;
+		if (found->second.rewritten || !master.IsFree(tick)) {
+			i++;
+			continue;
+		}
+		// The download's write-back into guest memory runs as a priority operation of its tick.
+		m_scheduler.WaitPriorityOperations(tick);
+		m_gpu_modified_ranges.Subtract(page, TRACKER_PAGE_SIZE);
+		m_memory_tracker.UnmarkRegionAsGpuModified(page, TRACKER_PAGE_SIZE);
+		found->second.pending_tick  = 0;
+		m_pending_readback_pages[i] = m_pending_readback_pages.back();
+		m_pending_readback_pages.pop_back();
+	}
 }
 
 BufferId BufferCache::FindBuffer(uint64_t vaddr, uint64_t size) {
@@ -464,6 +657,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	(void)SynchronizeBuffer(buffer, vaddr, size, is_written, is_texel_buffer);
 	if (is_written) {
 		m_gpu_modified_ranges.Add(vaddr, size);
+		MarkReadbackPagesWritten(vaddr, size);
 	}
 	return {&buffer, buffer.Offset(vaddr)};
 }
@@ -626,7 +820,14 @@ void BufferCache::RunGarbageCollector() {
 			return false;
 		}
 		if (dirty) {
-			EXIT_IF(!DownloadBufferMemory(buffer, buffer.CpuAddress(), buffer.Size()));
+			// One staging download holds at most 32 MiB; large buffers go in steps.
+			constexpr uint64_t ChunkSize  = 8ull * 1024 * 1024;
+			bool               downloaded = false;
+			for (uint64_t offset = 0; offset < buffer.Size(); offset += ChunkSize) {
+				downloaded |= DownloadBufferMemory(buffer, buffer.CpuAddress() + offset,
+				                                   std::min(ChunkSize, buffer.Size() - offset));
+			}
+			EXIT_IF(!downloaded);
 			dirty_buffers.push_back(id);
 		} else {
 			m_memory_tracker.UntrackMemory(buffer.CpuAddress(), buffer.Size());
@@ -640,6 +841,7 @@ void BufferCache::RunGarbageCollector() {
 
 	// Publish all queued downloads before releasing their tracked pages and owners.
 	const auto completion_tick = m_scheduler.CurrentTick();
+	PERFTMP_SCOPE("wait: buffer GC"); // PERFTMP
 	m_scheduler.Wait(completion_tick);
 	m_scheduler.WaitPriorityOperations(completion_tick);
 	for (const auto id: dirty_buffers) {

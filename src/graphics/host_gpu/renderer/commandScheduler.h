@@ -7,6 +7,7 @@
 #include "graphics/host_gpu/renderer/render.h"
 
 #include <condition_variable>
+#include <functional>
 #include <mutex>
 
 #include <queue>
@@ -22,15 +23,21 @@ public:
 	~CommandScheduler();
 	KYTY_CLASS_NO_COPY(CommandScheduler);
 
-	void           Begin(HW::Context& registers, HW::UserConfig& user_config, HW::Shader& shaders);
-	void           BeginRendering(const RenderState& state);
-	void           EndRendering();
-	void           Flush();
-	void           Flush(SubmitInfo& submit);
-	void           FlushAndWait();
-	void           Finish();
+	void Begin(HW::Context& registers, HW::UserConfig& user_config, HW::Shader& shaders);
+	void BeginRendering(const RenderState& state);
+	void EndRendering();
+	void Flush();
+	void Flush(SubmitInfo& submit);
+	void FlushAndWait();
+	void Finish();
+	// Recording is only submitted at waits and explicit flushes, which leaves the GPU idle while
+	// the host records up to the next wait. Submits every few completed draws/dispatches so the
+	// GPU starts on recorded work early; call sites must allow a new command buffer.
+	void           CompleteOperation();
 	CommandBuffer& BeginCommand();
 	uint64_t       Submit(SubmitInfo submit = {});
+	// Runs at the start of every Submit while the recording can still take commands.
+	void SetPreSubmitHook(std::function<void()> hook) { m_pre_submit = std::move(hook); }
 	// Deferred callbacks can observe an externally owned drain, but cannot initiate shutdown:
 	// the priority runner cannot join itself.
 	void                      Shutdown();
@@ -42,11 +49,11 @@ public:
 	void                      DeferPriorityOperation(Common::UniqueFunction<void>&& operation);
 	[[nodiscard]] static bool InDeferredOperation() noexcept;
 
-	[[nodiscard]] bool Active() const noexcept { return m_command.m_registers != nullptr; }
-	void                           CheckActive() const;
-	CommandBuffer&                 Current();
-	[[nodiscard]] uint64_t         CurrentTick() const noexcept { return m_master.CurrentTick(); }
-	[[nodiscard]] bool             IsFree(uint64_t tick);
+	[[nodiscard]] bool     Active() const noexcept { return m_command.m_registers != nullptr; }
+	void                   CheckActive() const;
+	CommandBuffer&         Current();
+	[[nodiscard]] uint64_t CurrentTick() const noexcept { return m_master.CurrentTick(); }
+	[[nodiscard]] bool     IsFree(uint64_t tick);
 	[[nodiscard]] MasterSemaphore& GetMasterSemaphore() noexcept { return m_master; }
 	[[nodiscard]] RenderContext&   Context() const noexcept { return m_context; }
 	[[nodiscard]] GraphicContext&  Graphics() const noexcept { return m_graphics; }
@@ -97,6 +104,9 @@ private:
 	bool                         m_priority_active      = false;
 	uint64_t                     m_priority_active_tick = 0;
 	OperationState               m_operation_state      = OperationState::Open;
+	uint32_t                     m_completed_operations = 0;
+	std::function<void()>        m_pre_submit;
+	bool                         m_in_pre_submit = false;
 };
 
 } // namespace Libs::Graphics

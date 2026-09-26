@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "common/perfTmp.h" // PERFTMP
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "common/virtualMemory.h"
@@ -292,13 +293,12 @@ public:
 	                     VirtualRangeType type = VirtualRangeType::Reserved) {
 		Common::LockGuard lock(m_mutex);
 
-		auto end = End(start, size);
-		for (const auto& r: m_ranges) {
-			if (r.type == type && start >= r.start && end <= End(r.start, r.size)) {
-				RemoveUnlocked(start, size);
-				MergeUnlocked();
-				return true;
-			}
+		const auto  end = End(start, size);
+		const auto* r   = ContainingUnlocked(start);
+		if (r != nullptr && r->type == type && end <= End(r->start, r->size)) {
+			RemoveUnlocked(start, size);
+			MergeUnlocked();
+			return true;
 		}
 
 		return false;
@@ -315,14 +315,8 @@ public:
 		auto current = start;
 		auto end     = End(start, size);
 		while (current < end) {
-			const Range* candidate = nullptr;
-			for (const auto& r: m_ranges) {
-				if (r.type == type && current >= r.start && current < End(r.start, r.size)) {
-					candidate = &r;
-					break;
-				}
-			}
-			if (candidate == nullptr) {
+			const Range* candidate = ContainingUnlocked(current);
+			if (candidate == nullptr || candidate->type != type) {
 				return false;
 			}
 			if (current == start && first_range != nullptr) {
@@ -587,24 +581,31 @@ private:
 			return false;
 		}
 
-		std::vector<Range> out;
-		bool               removed = false;
-		auto               rem_end = End(start, size);
-
-		for (const auto& r: m_ranges) {
-			auto r_end = End(r.start, r.size);
-			if (!VirtualRangesOverlap(start, size, r.start, r.size)) {
-				out.push_back(r);
-				continue;
-			}
-
-			removed = true;
-			AddPiece(&out, r, r.start, std::max(start, r.start));
-			AddPiece(&out, r, std::min(rem_end, r_end), r_end);
+		// Ranges are sorted and disjoint, so only a contiguous run can overlap; replace just that
+		// run with what is left of its first and last ranges.
+		const auto rem_end = End(start, size);
+		auto       first   = LowerBound(start);
+		if (first != m_ranges.begin() &&
+		    VirtualRangesOverlap(start, size, std::prev(first)->start, std::prev(first)->size)) {
+			--first;
+		}
+		auto last = first;
+		while (last != m_ranges.end() &&
+		       VirtualRangesOverlap(start, size, last->start, last->size)) {
+			++last;
+		}
+		if (first == last) {
+			return false;
 		}
 
-		m_ranges = out;
-		return removed;
+		std::vector<Range> pieces;
+		AddPiece(&pieces, *first, first->start, std::max(start, first->start));
+		const auto& tail = *std::prev(last);
+		AddPiece(&pieces, tail, std::min(rem_end, End(tail.start, tail.size)),
+		         End(tail.start, tail.size));
+		const auto at = m_ranges.erase(first, last);
+		m_ranges.insert(at, pieces.begin(), pieces.end());
+		return true;
 	}
 
 	void MergeUnlocked() {
@@ -612,21 +613,39 @@ private:
 			return;
 		}
 
-		std::sort(m_ranges.begin(), m_ranges.end(),
-		          [](const Range& left, const Range& right) { return left.start < right.start; });
-
-		std::vector<Range> merged;
-		for (const auto& r: m_ranges) {
-			if (!merged.empty()) {
-				auto& last = merged[merged.size() - 1];
-				if (End(last.start, last.size) == r.start && SameMergeKey(last, r)) {
-					last.size += r.size;
-					continue;
-				}
-			}
-			merged.push_back(r);
+		const auto by_start = [](const Range& left, const Range& right) {
+			return left.start < right.start;
+		};
+		if (!std::is_sorted(m_ranges.begin(), m_ranges.end(), by_start)) {
+			std::sort(m_ranges.begin(), m_ranges.end(), by_start);
 		}
-		m_ranges = merged;
+
+		size_t merged = 0;
+		for (size_t index = 1; index < m_ranges.size(); index++) {
+			auto&       last = m_ranges[merged];
+			const auto& r    = m_ranges[index];
+			if (End(last.start, last.size) == r.start && SameMergeKey(last, r)) {
+				last.size += r.size;
+				continue;
+			}
+			merged++;
+			if (merged != index) {
+				m_ranges[merged] = r;
+			}
+		}
+		m_ranges.resize(merged + 1u);
+	}
+
+	// The range holding addr; ranges are sorted and disjoint, so there is at most one.
+	const Range* ContainingUnlocked(uint64_t addr) const {
+		const auto next = std::upper_bound(
+		    m_ranges.begin(), m_ranges.end(), addr,
+		    [](uint64_t value, const Range& range) { return value < range.start; });
+		if (next == m_ranges.begin()) {
+			return nullptr;
+		}
+		const auto& range = *std::prev(next);
+		return addr < End(range.start, range.size) ? &range : nullptr;
 	}
 
 	Range* FindOverlap(uint64_t start, uint64_t size) {
@@ -870,8 +889,14 @@ bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size) {
 
 bool TryReadGpuCleanBacking(uint64_t vaddr, void* data, uint64_t size) {
 	if (g_gpu_resources != nullptr && IsGpuAddressRange(vaddr, size)) {
-		if (!Graphics::GuestGpu::IsGpuThread() ||
-		    GetGpuResources().GetTextureCache().IsRegionGpuModified(vaddr, size)) {
+		if (!Graphics::GuestGpu::IsGpuThread()) {
+			return false;
+		}
+		// Descriptor data can sit in memory a GPU pass last wrote as an image; write the image
+		// back like buffer data below instead of refusing the read.
+		auto& textures = GetGpuResources().GetTextureCache();
+		if (textures.IsRegionGpuModified(vaddr, size) &&
+		    !textures.FlushGpuModifiedImages(vaddr, size)) {
 			return false;
 		}
 		// A prior GPU pass in this frame may still hold the only up-to-date copy of this range
@@ -879,8 +904,28 @@ bool TryReadGpuCleanBacking(uint64_t vaddr, void* data, uint64_t size) {
 		// for it instead of refusing the read outright, the same way BufferCache::ReadMemory
 		// already does for other CPU readback paths.
 		if (GetGpuResources().GetBufferCache().HasGpuDirtyBytes(vaddr, size)) {
+			PERFTMP_SCOPE("ReadMemory from TryReadGpuCleanBacking"); // PERFTMP
 			GetGpuResources().GetBufferCache().ReadMemory(vaddr, size);
 		}
+	}
+	return TryReadBacking(vaddr, data, size);
+}
+
+bool IsGpuBufferOwned(uint64_t vaddr, uint64_t size) {
+	return g_gpu_resources != nullptr && IsGpuAddressRange(vaddr, size) &&
+	       Graphics::GuestGpu::IsGpuThread() &&
+	       GetGpuResources().GetBufferCache().HasGpuDirtyBytes(vaddr, size) &&
+	       !GetGpuResources().GetTextureCache().IsRegionGpuModified(vaddr, size);
+}
+
+// Like TryReadGpuCleanBacking, but refuses a range the GPU still owns any part of instead of
+// flushing it, so a caller reading more than it needs never waits on unrelated GPU work.
+bool TryReadGpuIdleBacking(uint64_t vaddr, void* data, uint64_t size) {
+	if (g_gpu_resources != nullptr && IsGpuAddressRange(vaddr, size) &&
+	    (!Graphics::GuestGpu::IsGpuThread() ||
+	     GetGpuResources().GetTextureCache().IsRegionGpuModified(vaddr, size) ||
+	     GetGpuResources().GetBufferCache().HasGpuDirtyBytes(vaddr, size))) {
+		return false;
 	}
 	return TryReadBacking(vaddr, data, size);
 }

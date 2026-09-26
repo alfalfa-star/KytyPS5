@@ -27,11 +27,10 @@ inline constexpr BufferId NULL_BUFFER_ID {0};
 
 class BufferCache {
 public:
-	static constexpr uint32_t CACHING_PAGEBITS  = 14;
-	static constexpr uint64_t CACHING_PAGESIZE  = uint64_t {1} << CACHING_PAGEBITS;
-	static constexpr uint64_t CACHING_NUMPAGES  = uint64_t {1} << (40 - CACHING_PAGEBITS);
-	static constexpr uint64_t BDA_PAGETABLE_SIZE =
-	    CACHING_NUMPAGES * sizeof(vk::DeviceAddress);
+	static constexpr uint32_t CACHING_PAGEBITS   = 14;
+	static constexpr uint64_t CACHING_PAGESIZE   = uint64_t {1} << CACHING_PAGEBITS;
+	static constexpr uint64_t CACHING_NUMPAGES   = uint64_t {1} << (40 - CACHING_PAGEBITS);
+	static constexpr uint64_t BDA_PAGETABLE_SIZE = CACHING_NUMPAGES * sizeof(vk::DeviceAddress);
 
 	BufferCache(GraphicContext& graphics, CommandScheduler& scheduler, PageManager& page_manager,
 	            TextureCache& texture_cache);
@@ -56,7 +55,7 @@ public:
 		EXIT("BufferCache: invalid utility-buffer usage\n");
 	}
 	[[nodiscard]] const Buffer* GetGdsBuffer() const noexcept { return &m_gds_buffer; }
-	[[nodiscard]] Buffer* GetBdaPageTableBuffer() noexcept { return &m_bda_pagetable_buffer; }
+	[[nodiscard]] Buffer*       GetBdaPageTableBuffer() noexcept { return &m_bda_pagetable_buffer; }
 	[[nodiscard]] Buffer* GetFaultBuffer() noexcept { return m_fault_manager.GetFaultBuffer(); }
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBufferForImage(uint64_t vaddr, uint64_t size);
 	void FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool is_gds);
@@ -96,35 +95,57 @@ private:
 	void JoinOverlap(BufferId new_id, BufferId overlap_id, bool accumulate_stream_score);
 	[[nodiscard]] BufferId CreateBuffer(uint64_t vaddr, uint64_t size);
 	void                   Register(BufferId id);
-	void Unregister(BufferId id);
+	void                   Unregister(BufferId id);
 	template <bool insert>
-	void ChangeRegister(BufferId id);
-	void DeleteBuffer(BufferId id);
-	[[nodiscard]] bool SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t size,
-	                                     bool is_written, bool is_texel_buffer);
+	void                     ChangeRegister(BufferId id);
+	void                     DeleteBuffer(BufferId id);
+	[[nodiscard]] bool       SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t size,
+	                                           bool is_written, bool is_texel_buffer);
 	[[nodiscard]] vk::Buffer UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> copies,
 	                                      uint64_t total_size);
 	[[nodiscard]] bool SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uint64_t size);
 	// Queues backing publication; callers wait before clearing dirty pages or reusing their data.
-	[[nodiscard]] bool DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size);
+	// keep_dirty leaves the range GPU-dirty; the caller clears it once the download completed.
+	[[nodiscard]] bool DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size,
+	                                        bool keep_dirty = false);
 
-	GraphicContext&                                   m_graphics;
-	CommandScheduler&                                 m_scheduler;
-	FaultManager                                      m_fault_manager;
-	Buffer                                            m_gds_buffer;
-	Buffer                                            m_bda_pagetable_buffer;
-	Common::SlotVector<Buffer>                        m_slot_buffers;
+	// Pages the CPU keeps reading back after the GPU writes them (query results, counters,
+	// records next to CPU data). Each readback of such a page otherwise submits the recording
+	// and waits for the whole queue, so they are downloaded ahead of time:
+	//  - DownloadRecentReadbackPages joins them to a readback that has to wait anyway;
+	//  - PrefetchReadbackPages records their download at the end of each submission that
+	//    wrote them, and FinalizeReadbackPrefetches marks them clean once it completed.
+	struct ReadbackPage {
+		int64_t  last_fault_ms = 0;
+		uint64_t pending_tick  = 0; // tick of an in-flight prefetch, 0 if none
+		bool     rewritten     = false;
+	};
+	[[nodiscard]] std::vector<uint64_t>
+	     DownloadRecentReadbackPages(uint64_t vaddr, uint64_t window_begin, uint64_t window_end);
+	void MarkReadbackPagesWritten(uint64_t vaddr, uint64_t size);
+	void PrefetchReadbackPages();
+	void FinalizeReadbackPrefetches();
+
+	GraphicContext&                                    m_graphics;
+	CommandScheduler&                                  m_scheduler;
+	FaultManager                                       m_fault_manager;
+	Buffer                                             m_gds_buffer;
+	Buffer                                             m_bda_pagetable_buffer;
+	Common::SlotVector<Buffer>                         m_slot_buffers;
 	Common::LeastRecentlyUsedCache<BufferId, uint64_t> m_lru_cache;
-	BufferMap                                         m_buffers;
-	PageTable                                         m_page_table;
-	RangeSet                                          m_gpu_modified_ranges;
-	MemoryTracker                                     m_memory_tracker;
-	StreamBuffer                                      m_staging_buffer;
-	StreamBuffer                                      m_stream_buffer;
-	StreamBuffer                                      m_download_buffer;
-	StreamBuffer                                      m_device_buffer;
-	TextureCache&                                     m_texture_cache;
-	uint64_t                                          m_total_used_memory  = 0;
+	BufferMap                                          m_buffers;
+	PageTable                                          m_page_table;
+	RangeSet                                           m_gpu_modified_ranges;
+	std::map<uint64_t, ReadbackPage>                   m_readback_pages;
+	std::vector<uint64_t>                              m_rewritten_readback_pages;
+	std::vector<uint64_t>                              m_pending_readback_pages;
+	MemoryTracker                                      m_memory_tracker;
+	StreamBuffer                                       m_staging_buffer;
+	StreamBuffer                                       m_stream_buffer;
+	StreamBuffer                                       m_download_buffer;
+	StreamBuffer                                       m_device_buffer;
+	TextureCache&                                      m_texture_cache;
+	uint64_t                                           m_total_used_memory = 0;
 	uint64_t m_trigger_gc_memory  = 1ull * 1024 * 1024 * 1024;
 	uint64_t m_critical_gc_memory = 2ull * 1024 * 1024 * 1024;
 	uint64_t m_gc_tick            = 0;

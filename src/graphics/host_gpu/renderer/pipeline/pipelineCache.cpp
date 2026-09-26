@@ -30,6 +30,7 @@
 #include <spirv-tools/libspirv.hpp>
 #include <string_view>
 #include <tuple>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 #include <xxhash.h>
@@ -109,6 +110,67 @@ bool ReadShaderGuestMemory(void*, uint64_t address, uint32_t* value) {
 	}
 	return false;
 }
+
+// One resource materialization reads descriptor tables word by word, often thousands of
+// entries in the same few pages, and every guest read checks mappings and GPU ownership.
+// Copy each page the GPU does not own once; any other page keeps the per-word path.
+class ShaderMemoryPageCache {
+public:
+	static constexpr uint64_t PageSize = 0x1000;
+
+	bool Read(uint64_t address, uint32_t* value) {
+		if (value == nullptr || (address & 3u) != 0u) {
+			return ReadShaderGuestMemory(nullptr, address, value);
+		}
+		const auto  base = address & ~(PageSize - 1u);
+		const auto* page = Find(base);
+		if (page == nullptr) {
+			page = Load(base);
+		}
+		if (page->words.empty()) {
+			return ReadShaderGuestMemory(nullptr, address, value);
+		}
+		*value = page->words[(address - base) / sizeof(uint32_t)];
+		return true;
+	}
+
+	static bool Reader(void* userdata, uint64_t address, uint32_t* value) {
+		return static_cast<ShaderMemoryPageCache*>(userdata)->Read(address, value);
+	}
+
+private:
+	struct Page {
+		uint64_t              base = 0;
+		std::vector<uint32_t> words; // empty: the page is not readable as a whole
+	};
+
+	const Page* Find(uint64_t base) {
+		if (m_last < m_pages.size() && m_pages[m_last].base == base) {
+			return &m_pages[m_last];
+		}
+		const auto found = m_index.find(base);
+		if (found == m_index.end()) {
+			return nullptr;
+		}
+		m_last = found->second;
+		return &m_pages[m_last];
+	}
+
+	const Page* Load(uint64_t base) {
+		Page page {.base = base, .words = std::vector<uint32_t>(PageSize / sizeof(uint32_t))};
+		if (!Libs::LibKernel::Memory::TryReadGpuIdleBacking(base, page.words.data(), PageSize)) {
+			page.words.clear();
+		}
+		m_last = m_pages.size();
+		m_index.emplace(base, m_last);
+		m_pages.push_back(std::move(page));
+		return &m_pages[m_last];
+	}
+
+	std::vector<Page>                    m_pages;
+	std::unordered_map<uint64_t, size_t> m_index;
+	size_t                               m_last = 0;
+};
 
 void DumpShaderSpirv(const char* stage_name, uint64_t shader_hash,
                      const std::vector<uint32_t>& spirv) {
@@ -275,8 +337,11 @@ struct PipelineCache::ProgramCache {
 	}
 
 	template <typename InputInfo>
-	ShaderProgram Get(const ShaderParams& params, InputInfo& input_info,
-	                  uint32_t& push_data_cursor) {
+	// speculative: the caller may not run this shader (e.g. an indirect dispatch whose counts
+	// are still on the GPU), so a shader never seen before or state that does not materialize
+	// returns an empty program instead of being compiled or treated as fatal.
+	ShaderProgram Get(const ShaderParams& params, InputInfo& input_info, uint32_t& push_data_cursor,
+	                  bool speculative = false) {
 		ShaderType stage;
 		if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
 			stage = input_info.logical_stage;
@@ -295,6 +360,7 @@ struct PipelineCache::ProgramCache {
 		auto                                         entry = programs.find(lookup_key);
 		ShaderRecompiler::IR::ResourceSnapshot       resources;
 		ShaderRecompiler::IR::ResourceSpecialization specialization;
+		ShaderMemoryPageCache                        page_cache;
 		const ShaderRecompiler::IR::SrtRuntime       runtime {
 		    .user_data   = params.user_data,
 		    .shader_base = params.Base(),
@@ -303,12 +369,23 @@ struct PipelineCache::ProgramCache {
 		    // valid host pointer, so without this the evaluator's default "treat it as host
 		    // memory" fallback segfaults; give it the same safe guest reader as specialization
 		    // reads use.
-		    .read_memory                = ReadShaderGuestMemory,
-		    .read_specialization_memory = ReadShaderGuestMemory,
+		    .read_memory                = ShaderMemoryPageCache::Reader,
+		    .userdata                   = &page_cache,
+		    .read_specialization_memory = ShaderMemoryPageCache::Reader,
+		    .gpu_owned =
+		        [](void*, uint64_t address) {
+			        return Libs::LibKernel::Memory::IsGpuBufferOwned(address, sizeof(uint32_t));
+		        },
 		};
+		if (speculative && entry == programs.end()) {
+			return {};
+		}
 		if (entry != programs.end()) {
 			if (!ShaderRecompiler::IR::MaterializeResources(entry->second.resource_plan, runtime,
 			                                                resources, specialization)) {
+				if (speculative) {
+					return {};
+				}
 				EXIT("resource materialization failed for shader hash=0x%016" PRIx64 "\n",
 				     params.hash);
 			}
@@ -668,12 +745,13 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 
 ShaderProgram PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs,
                                                const HW::ShaderRegisters&   sh,
-                                               ShaderComputeInputInfo&      input_info) {
+                                               ShaderComputeInputInfo&      input_info,
+                                               bool                         speculative) {
 	input_info.host_subgroup_size = m_graphics.SupportsComputeWave64() ? 64u : 32u;
 	const auto        params      = PrepareProgram(regs, sh, input_info);
 	Common::LockGuard lock(m_mutex);
 	uint32_t          push_data_cursor = 0;
-	return m_program_cache->Get(params, input_info, push_data_cursor);
+	return m_program_cache->Get(params, input_info, push_data_cursor, speculative);
 }
 
 bool PipelineStaticParameters::operator==(const PipelineStaticParameters& other) const noexcept {

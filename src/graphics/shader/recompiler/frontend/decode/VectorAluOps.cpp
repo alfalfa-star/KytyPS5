@@ -254,17 +254,19 @@ constexpr VopcOpcodeInfo VOPC_OPCODE_LIST[] = {
     {0xe1u, Opcode::V_CMP_LT_U64, false},  {0xe2u, Opcode::V_CMP_EQ_U64, false},
     {0xe4u, Opcode::V_CMP_GT_U64, false},  {0xe5u, Opcode::V_CMP_NE_U64, false},
     {0xf5u, Opcode::V_CMPX_NE_U64, false}, {0xc9u, Opcode::V_CMP_LT_F16},
-    {0xcau, Opcode::V_CMP_EQ_F16},         {0xcbu, Opcode::V_CMP_LE_F16},
-    {0xccu, Opcode::V_CMP_GT_F16},         {0xcdu, Opcode::V_CMP_LG_F16},
-    {0xceu, Opcode::V_CMP_GE_F16},         {0xebu, Opcode::V_CMP_NGT_F16},
-    {0xedu, Opcode::V_CMP_NEQ_F16},        {0xeeu, Opcode::V_CMP_NLT_F16},
-    {0xe9u, Opcode::V_CMP_NGE_F16},        {0xeau, Opcode::V_CMP_NLG_F16},
-    {0xecu, Opcode::V_CMP_NLE_F16},        {0xd9u, Opcode::V_CMPX_LT_F16},
-    {0xdau, Opcode::V_CMPX_EQ_F16},        {0xdbu, Opcode::V_CMPX_LE_F16},
-    {0xdcu, Opcode::V_CMPX_GT_F16},        {0xdeu, Opcode::V_CMPX_GE_F16},
-    {0xfbu, Opcode::V_CMPX_NGT_F16},       {0xfdu, Opcode::V_CMPX_NEQ_F16},
-    {0xfeu, Opcode::V_CMPX_NLT_F16},       {0xf9u, Opcode::V_CMPX_NGE_F16},
-    {0xfau, Opcode::V_CMPX_NLG_F16},       {0xfcu, Opcode::V_CMPX_NLE_F16},
+    {0xf1u, Opcode::V_CMPX_LT_U64, false}, {0xf2u, Opcode::V_CMPX_EQ_U64, false},
+    {0xf4u, Opcode::V_CMPX_GT_U64, false}, {0xcau, Opcode::V_CMP_EQ_F16},
+    {0xcbu, Opcode::V_CMP_LE_F16},         {0xccu, Opcode::V_CMP_GT_F16},
+    {0xcdu, Opcode::V_CMP_LG_F16},         {0xceu, Opcode::V_CMP_GE_F16},
+    {0xebu, Opcode::V_CMP_NGT_F16},        {0xedu, Opcode::V_CMP_NEQ_F16},
+    {0xeeu, Opcode::V_CMP_NLT_F16},        {0xe9u, Opcode::V_CMP_NGE_F16},
+    {0xeau, Opcode::V_CMP_NLG_F16},        {0xecu, Opcode::V_CMP_NLE_F16},
+    {0xd9u, Opcode::V_CMPX_LT_F16},        {0xdau, Opcode::V_CMPX_EQ_F16},
+    {0xdbu, Opcode::V_CMPX_LE_F16},        {0xdcu, Opcode::V_CMPX_GT_F16},
+    {0xdeu, Opcode::V_CMPX_GE_F16},        {0xfbu, Opcode::V_CMPX_NGT_F16},
+    {0xfdu, Opcode::V_CMPX_NEQ_F16},       {0xfeu, Opcode::V_CMPX_NLT_F16},
+    {0xf9u, Opcode::V_CMPX_NGE_F16},       {0xfau, Opcode::V_CMPX_NLG_F16},
+    {0xfcu, Opcode::V_CMPX_NLE_F16},
 };
 
 constexpr auto VOPC_OPS = Detail::MakeOpcodeTable<0x100>(VOPC_OPCODE_LIST);
@@ -1478,6 +1480,9 @@ bool IsVopcCompareExec(Opcode opcode) {
 		case Opcode::V_CMPX_GE_U32:
 		case Opcode::V_CMPX_NE_I64:
 		case Opcode::V_CMPX_NE_U64:
+		case Opcode::V_CMPX_LT_U64:
+		case Opcode::V_CMPX_EQ_U64:
+		case Opcode::V_CMPX_GT_U64:
 		case Opcode::V_CMPX_LT_U16:
 		case Opcode::V_CMPX_GT_U16:
 		case Opcode::V_CMPX_EQ_U16:

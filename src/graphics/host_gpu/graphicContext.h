@@ -39,10 +39,12 @@ struct GraphicContext {
 	uint32_t                                  min_subgroup_size                     = 0;
 	uint32_t                                  max_subgroup_size                     = 0;
 	uint32_t                                  max_push_descriptors                  = 0;
-	vk::ShaderStageFlags                      required_subgroup_size_stages         = {};
-	Common::Mutex                             queue_mutex;
-	uint32_t                                  queue_family = static_cast<uint32_t>(-1);
-	vk::Queue                                 queue        = nullptr;
+	// Descriptor set 1 of every pipeline layout (BindlessHeap).
+	vk::DescriptorSetLayout bindless_set_layout           = nullptr;
+	vk::ShaderStageFlags    required_subgroup_size_stages = {};
+	Common::Mutex           queue_mutex;
+	uint32_t                queue_family = static_cast<uint32_t>(-1);
+	vk::Queue               queue        = nullptr;
 
 	[[nodiscard]] const vk::PhysicalDeviceProperties& GetPhysicalDeviceProperties() const {
 		return physical_device_properties;

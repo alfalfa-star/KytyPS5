@@ -626,8 +626,33 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto& mem        = ctx.Memory(inst);
 	const auto  image_arg  = inst.Arg(0);
 	ctx.ResourceIndex(image_arg, IR::ValueOpcode::GetImageResource);
-	const auto& image   = state.program.info.images.at(mem.resource);
-	const auto* address = ctx.ImageAddress(inst.Arg(image_info.needs_sampler ? 2 : 1));
+	const auto& image           = state.program.info.images.at(mem.resource);
+	const auto* address         = ctx.ImageAddress(inst.Arg(image_info.needs_sampler ? 2 : 1));
+	state.bindless_image_slot   = 0;
+	state.bindless_sampler_slot = 0;
+	if (image.bindless) {
+		const auto* handle = image_arg.ResolveInstruction();
+		const auto  kind   = IR::Bindless::ImageKind(image.dimension);
+		if (handle == nullptr || handle->NumArgs() != 8u || !kind.has_value()) {
+			ctx.Fail(inst, "has an invalid bindless image handle");
+		}
+		std::array<uint32_t, 8> dwords {};
+		for (uint32_t dword = 0; dword < 8u; dword++) {
+			dwords[dword] = ctx.Def(handle->Arg(dword));
+		}
+		state.bindless_image_slot = EmitBindlessLookup(state, *kind, dwords);
+	}
+	if (image_info.needs_sampler && state.program.info.samplers.at(mem.sampler).bindless) {
+		const auto* handle = inst.Arg(1).ResolveInstruction();
+		if (handle == nullptr || handle->NumArgs() != 4u) {
+			ctx.Fail(inst, "has an invalid bindless sampler handle");
+		}
+		std::array<uint32_t, 8> dwords {};
+		for (uint32_t dword = 0; dword < 8u; dword++) {
+			dwords[dword] = dword < 4u ? ctx.Def(handle->Arg(dword)) : ConstantU32(state, 0u);
+		}
+		state.bindless_sampler_slot = EmitBindlessLookup(state, IR::Bindless::KindSampler, dwords);
+	}
 	if (op == IR::ValueOpcode::ImageQueryDimensions) {
 		state.builder.RequireCapability(spv::CapabilityImageQuery);
 		ctx.Define(inst, QueryDimensions(ctx, mem, *address));

@@ -2,6 +2,7 @@
 #include "common/common.h"
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
+#include "common/perfTmp.h" // PERFTMP
 #include "common/profiler.h"
 #include "common/threads.h"
 #include "graphics/host_gpu/graphicContext.h"
@@ -294,17 +295,17 @@ public:
 private:
 	void Destroy();
 
-	WindowContext&              m_window;
-	vk::SwapchainKHR            m_handle = nullptr;
-	vk::Format                  m_format = vk::Format::eUndefined;
-	vk::Extent2D                m_extent {};
-	std::vector<vk::Image>      m_images;
-	std::vector<vk::ImageView>  m_image_views;
-	std::vector<vk::Semaphore>  m_image_acquired;
-	std::vector<vk::Semaphore>  m_render_complete;
+	WindowContext&                 m_window;
+	vk::SwapchainKHR               m_handle = nullptr;
+	vk::Format                     m_format = vk::Format::eUndefined;
+	vk::Extent2D                   m_extent {};
+	std::vector<vk::Image>         m_images;
+	std::vector<vk::ImageView>     m_image_views;
+	std::vector<vk::Semaphore>     m_image_acquired;
+	std::vector<vk::Semaphore>     m_render_complete;
 	std::unique_ptr<SystemOverlay> m_system_overlay;
-	uint32_t                    m_image_index = static_cast<uint32_t>(-1);
-	uint32_t                    m_frame_index = 0;
+	uint32_t                       m_image_index = static_cast<uint32_t>(-1);
+	uint32_t                       m_frame_index = 0;
 };
 
 struct Presenter::Impl {
@@ -360,7 +361,7 @@ void Swapchain::Create() {
 	Common::LockGuard lock(m_window.mutex);
 	EXIT_IF(graphics.screen_width == 0);
 	EXIT_IF(graphics.screen_height == 0);
-	const auto&       surface = m_window.surface_capabilities;
+	const auto& surface = m_window.surface_capabilities;
 	EXIT_NOT_IMPLEMENTED(surface.formats.empty());
 
 	m_extent = surface.capabilities.currentExtent;
@@ -432,7 +433,7 @@ void Swapchain::Create() {
 		LOGF("warning: requested present mode is unavailable; falling back to Fifo\n");
 		create_info.presentMode = vk::PresentModeKHR::eFifo;
 	}
-	create_info.clipped          = VK_TRUE;
+	create_info.clipped = VK_TRUE;
 	RequireVulkanSuccess(graphics.device.createSwapchainKHR(&create_info, nullptr, &m_handle),
 	                     "vkCreateSwapchainKHR");
 	EXIT_IF(m_handle == nullptr);
@@ -664,6 +665,7 @@ uint64_t Swapchain::Submit(CommandScheduler& scheduler) {
 }
 
 Swapchain::Status Swapchain::Present() {
+	PERFTMP_SCOPE(__PRETTY_FUNCTION__); // PERFTMP
 	EXIT_IF(m_image_index >= m_render_complete.size());
 	const auto         ready = m_render_complete[m_image_index];
 	vk::PresentInfoKHR present {};
@@ -760,12 +762,75 @@ RenderContext& Presenter::Renderer() const noexcept {
 	return m_impl->renderer;
 }
 
+static void DumpFrameTmp(GraphicContext& graphics, CommandScheduler& scheduler,
+                         VulkanImage& image) { // PERFTMP
+	static const char* dir = std::getenv("KYTY_FRAME_DUMP_DIR");
+	static const int   every =
+	    std::getenv("KYTY_FRAME_DUMP_EVERY") ? std::atoi(std::getenv("KYTY_FRAME_DUMP_EVERY")) : 60;
+	static int frame = 0;
+	if (dir == nullptr || (++frame % every) != 0) return;
+	const auto           w = image.extent.width, h = image.extent.height;
+	vk::BufferCreateInfo create {};
+	create.size  = uint64_t(w) * h * 4;
+	create.usage = vk::BufferUsageFlagBits::eTransferDst;
+	VmaAllocationCreateInfo alloc {};
+	alloc.usage = VMA_MEMORY_USAGE_AUTO;
+	alloc.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
+	VkBuffer          buffer = VK_NULL_HANDLE;
+	VmaAllocation     memory = nullptr;
+	VmaAllocationInfo info {};
+	const auto        raw = static_cast<VkBufferCreateInfo>(create);
+	if (vmaCreateBuffer(graphics.allocator, &raw, &alloc, &buffer, &memory, &info) != VK_SUCCESS)
+		return;
+	auto&               command = scheduler.BeginCommand();
+	vk::BufferImageCopy copy {};
+	copy.imageSubresource.aspectMask = vk::ImageAspectFlagBits::eColor;
+	copy.imageSubresource.layerCount = 1;
+	copy.imageExtent                 = vk::Extent3D {w, h, 1};
+	command.Handle().copyImageToBuffer(image.image, vk::ImageLayout::eTransferSrcOptimal, buffer, 1,
+	                                   &copy);
+	const auto tick = scheduler.Submit();
+	scheduler.GetMasterSemaphore().Wait(tick);
+	vmaInvalidateAllocation(graphics.allocator, memory, 0, VK_WHOLE_SIZE);
+	const auto path = fmt::format("{}/frame_{:05d}.ppm", dir, frame);
+	if (FILE* f = std::fopen(path.c_str(), "wb")) {
+		std::fprintf(f, "P6\n%u %u\n255\n", w, h);
+		const auto* px = static_cast<const uint8_t*>(info.pMappedData);
+		const bool  bgr =
+		    image.format == vk::Format::eB8G8R8A8Unorm || image.format == vk::Format::eB8G8R8A8Srgb;
+		std::vector<uint8_t> row(size_t(w) * 3);
+		for (uint32_t y = 0; y < h; y++) {
+			for (uint32_t x = 0; x < w; x++) {
+				const auto* p = px + (size_t(y) * w + x) * 4;
+				if (image.format == vk::Format::eA2B10G10R10UnormPack32) {
+					uint32_t v;
+					std::memcpy(&v, p, 4);
+					row[x * 3]     = uint8_t((v & 0x3ffu) >> 2u);
+					row[x * 3 + 1] = uint8_t(((v >> 10u) & 0x3ffu) >> 2u);
+					row[x * 3 + 2] = uint8_t(((v >> 20u) & 0x3ffu) >> 2u);
+					continue;
+				}
+				row[x * 3]     = bgr ? p[2] : p[0];
+				row[x * 3 + 1] = p[1];
+				row[x * 3 + 2] = bgr ? p[0] : p[2];
+			}
+			std::fwrite(row.data(), 1, row.size(), f);
+		}
+		std::fclose(f);
+		std::fprintf(stderr, "PERFTMP dumped %s format=%d\n", path.c_str(),
+		             static_cast<int>(image.format));
+	}
+	vmaDestroyBuffer(graphics.allocator, buffer, memory);
+}
+
 void Presenter::Present(Frame& frame, bool reuse) {
+	PERFTMP_SCOPE(__PRETTY_FUNCTION__); // PERFTMP
 	KYTY_PROFILER_FUNCTION();
+	DumpFrameTmp(m_impl->window.graphic_ctx, m_impl->present_scheduler, frame.image); // PERFTMP
 	m_impl->frames.ValidateForPresent(&frame, reuse);
 
 	const auto overlay_visual = GetSystemOverlayVisualState();
-	auto&      swapchain  = m_impl->swapchain;
+	auto&      swapchain      = m_impl->swapchain;
 	for (uint32_t attempt = 0; attempt < 2; attempt++) {
 		auto status = swapchain.AcquireNextImage();
 		if (status != Swapchain::Status::Success) {
@@ -774,7 +839,7 @@ void Presenter::Present(Frame& frame, bool reuse) {
 		}
 		{
 			Common::LockGuard render_lock(m_impl->renderer.GetMutex());
-			auto&             command          = m_impl->present_scheduler.BeginCommand();
+			auto&             command = m_impl->present_scheduler.BeginCommand();
 			const bool        draw_system_overlay =
 			    overlay_visual.active && swapchain.PrepareSystemOverlay();
 			swapchain.RecordPresentCommands(command, frame.image, draw_system_overlay);

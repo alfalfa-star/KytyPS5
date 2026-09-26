@@ -4,6 +4,7 @@
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
+#include "common/perfTmp.h" // PERFTMP
 #include "common/profiler.h"
 #include "graphics/guest_gpu/gpu_format.h"
 #include "graphics/guest_gpu/tile.h"
@@ -517,14 +518,17 @@ TextureCache::ImageIds TextureCache::FindImagesInRegion(uint64_t address, uint64
 }
 
 ImageId TextureCache::GetNullImage(const ImageDesc& desc) {
-	const auto format = desc.info.pixel_format;
-	if (const auto found = m_null_images.find(format); found != m_null_images.end()) {
+	// A 3D view (e.g. the bindless heap's null volume) needs a 3D image.
+	const bool volume = desc.info.type == Prospero::ImageType::kColor3D;
+	const auto key =
+	    static_cast<uint64_t>(desc.info.pixel_format) | (static_cast<uint64_t>(volume) << 32u);
+	if (const auto found = m_null_images.find(key); found != m_null_images.end()) {
 		return found->second;
 	}
 	ImageInfo info {};
 	info.pixel_format    = desc.info.pixel_format;
 	info.guest_format    = desc.info.guest_format;
-	info.type            = Prospero::ImageType::kColor2D;
+	info.type            = volume ? Prospero::ImageType::kColor3D : Prospero::ImageType::kColor2D;
 	info.extent          = {1, 1, 1};
 	info.resources       = {1, 1};
 	info.pitch           = 1;
@@ -533,7 +537,7 @@ ImageId TextureCache::GetNullImage(const ImageDesc& desc) {
 	info.tile_mode       = Prospero::TileMode::kLinear;
 	info.mip_layout[0]   = {0, info.bytes_per_block, 1, 1};
 	const auto id        = InsertImage(info);
-	m_null_images.emplace(format, id);
+	m_null_images.emplace(key, id);
 	return id;
 }
 
@@ -1135,6 +1139,7 @@ void TextureCache::InitializeImage(ImageId id) {
 
 void TextureCache::MaterializeDccClear(ImageId id, const ImageDesc& desc,
                                        uint32_t metadata_base_layer) {
+	PERFTMP_SCOPE(__PRETTY_FUNCTION__); // PERFTMP
 	if (desc.info.metadata.kind != ImageMetadataKind::Dcc) {
 		return;
 	}
@@ -1145,6 +1150,9 @@ void TextureCache::MaterializeDccClear(ImageId id, const ImageDesc& desc,
 		image.info.metadata    = desc.info.metadata;
 		// A native DCC allocation must not retain a reused HTile/CMask/FMask interpretation.
 		m_surface_metas.erase(range.address);
+		if (range.Valid()) {
+			m_dcc_ranges[range.address] = range.size;
+		}
 		if (range.size == 0 || desc.info.resources.levels != 1 ||
 		    image.info.resources.levels != 1) {
 			return;
@@ -1168,6 +1176,7 @@ void TextureCache::MaterializeDccClear(ImageId id, const ImageDesc& desc,
 	// Finish native metadata writes before reading backing bytes. This can submit the scheduler,
 	// so discovery runs before final draw uploads and never holds the texture lock across it.
 	if (m_buffer_cache.IsRegionGpuModified(range.address, range.size)) {
+		PERFTMP_SCOPE("ReadMemory from DCC clear"); // PERFTMP
 		m_buffer_cache.ReadMemory(range.address, range.size, false);
 	}
 	const auto slice_size = range.size / layers;
@@ -1255,6 +1264,7 @@ void TextureCache::AssociateStencil(ImageId depth_id, GuestRange stencil) {
 }
 
 ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
+	PERFTMP_SCOPE(__PRETTY_FUNCTION__); // PERFTMP
 	auto& command = m_scheduler.Current();
 	if (command.IsInvalid()) {
 		EXIT("TextureCache: image lookup requires a valid command buffer\n");
@@ -1344,6 +1354,7 @@ void TextureCache::UpdateImage(ImageId id) {
 }
 
 ImageId TextureCache::FindImageFromRange(uint64_t address, uint64_t size, bool ensure_valid) {
+	PERFTMP_SCOPE(__PRETTY_FUNCTION__); // PERFTMP
 	if (!GuestRange {address, size}.Valid()) {
 		return {};
 	}
@@ -1625,7 +1636,11 @@ void TextureCache::InvalidateMemory(uint64_t address, uint64_t size) {
 	if (!GuestRange {address, size}.Valid()) {
 		EXIT("TextureCache: invalid memory-invalidation range\n");
 	}
-	std::scoped_lock lock {m_lock};
+	std::unique_lock lock {m_lock, std::defer_lock};
+	{
+		PERFTMP_SCOPE("texture invalidate lock wait"); // PERFTMP
+		lock.lock();
+	}
 	InvalidateCpuAliases(address, size);
 }
 
@@ -1860,6 +1875,43 @@ bool TextureCache::IsRegionGpuModified(uint64_t address, uint64_t size) {
 	return false;
 }
 
+bool TextureCache::FlushGpuModifiedImages(uint64_t address, uint64_t size) {
+	if (!GuestRange {address, size}.Valid()) {
+		return false;
+	}
+	std::vector<ImageId> flushed;
+	{
+		std::scoped_lock lock {m_lock};
+		for (const auto id: FindImagesInRegion(address, size, false)) {
+			const auto& image = m_slot_images[id];
+			// The CPU wrote this memory after the GPU did (e.g. reused it for descriptors), so
+			// memory is already the newer copy there.
+			if (image.depth_id || !image.IsGpuModified() || image.IsCpuDirty()) {
+				continue;
+			}
+			if (!DownloadImageMemory(id)) {
+				return false;
+			}
+			flushed.push_back(id);
+		}
+	}
+	if (flushed.empty()) {
+		return true;
+	}
+	const auto tick = m_scheduler.CurrentTick();
+	PERFTMP_SCOPE("wait: texture flush for reads"); // PERFTMP
+	m_scheduler.Wait(tick);
+	m_scheduler.WaitPriorityOperations(tick);
+	// Guest memory now holds what the GPU wrote, so it is the up-to-date copy again.
+	std::scoped_lock lock {m_lock};
+	for (const auto id: flushed) {
+		if (auto* image = m_slot_images.try_get(id); image != nullptr) {
+			image->ClearGpuModified();
+		}
+	}
+	return true;
+}
+
 void TextureCache::InvalidateCpuAliases(uint64_t address, uint64_t size) {
 	const auto page_begin = Common::AlignDown(address, TRACKER_PAGE_SIZE);
 	const auto page_end   = Common::AlignUp(address + size, TRACKER_PAGE_SIZE);
@@ -1889,6 +1941,20 @@ bool TextureCache::IsMeta(uint64_t address) {
 	std::scoped_lock lock {m_lock};
 	const auto       found = m_surface_metas.find(address);
 	return found != m_surface_metas.end();
+}
+
+bool TextureCache::IsDccMetadataOnly(uint64_t address, uint64_t size) {
+	const GuestRange range {address, size};
+	if (!range.Valid()) {
+		return false;
+	}
+	std::scoped_lock lock {m_lock};
+	if (!FindImagesInRegion(address, size, false).empty()) {
+		return false;
+	}
+	auto next = m_dcc_ranges.lower_bound(range.End());
+	return next != m_dcc_ranges.begin() &&
+	       address < std::prev(next)->first + std::prev(next)->second;
 }
 
 bool TextureCache::IsMetaCleared(uint64_t address, uint32_t slice) {
@@ -1933,6 +1999,7 @@ void TextureCache::UnmapMemory(uint64_t address, uint64_t size) {
 			++metadata;
 		}
 	}
+	m_dcc_ranges.erase(m_dcc_ranges.lower_bound(address), m_dcc_ranges.lower_bound(address + size));
 	auto images = FindImagesInRegion(address, size, false);
 	for (const auto id: images) {
 		auto owner = m_slot_images.try_get(id);

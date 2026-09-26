@@ -66,8 +66,13 @@ public:
 	void               InvalidateMemory(uint64_t address, uint64_t size);
 	void               InvalidateMemoryFromGPU(uint64_t address, uint64_t size);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t address, uint64_t size);
+	// Makes guest memory current over a range: GPU-modified color images the CPU has not
+	// written since are downloaded and waited for. False when one cannot be downloaded.
+	[[nodiscard]] bool FlushGpuModifiedImages(uint64_t address, uint64_t size);
 
 	[[nodiscard]] bool IsMeta(uint64_t address);
+	// True when a range overlaps DCC metadata a surface was bound with and holds no image data.
+	[[nodiscard]] bool IsDccMetadataOnly(uint64_t address, uint64_t size);
 	[[nodiscard]] bool IsMetaCleared(uint64_t address, uint32_t slice);
 	[[nodiscard]] bool ClearMeta(uint64_t address);
 	[[nodiscard]] bool TouchMeta(uint64_t address, uint32_t slice, bool is_clear);
@@ -176,10 +181,11 @@ private:
 	BufferCache&                                      m_buffer_cache;
 	Common::SlotVector<Image>                         m_slot_images;
 	ImagePageTable                                    m_image_page_table;
-	std::unordered_map<vk::Format, ImageId>           m_null_images;
+	std::unordered_map<uint64_t, ImageId>             m_null_images; // format | volume << 32
 	Common::LeastRecentlyUsedCache<ImageId, uint64_t> m_lru_cache;
 	std::unordered_set<ImageId>                       m_download_images;
 	std::map<uint64_t, MetaDataInfo>                  m_surface_metas;
+	std::map<uint64_t, uint64_t>                      m_dcc_ranges; // base -> size
 	uint64_t                                          m_total_used_memory  = 0;
 	uint64_t                                          m_trigger_gc_memory  = 0;
 	uint64_t                                          m_pressure_gc_memory = 1536ull * 1024 * 1024;

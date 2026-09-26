@@ -11,6 +11,8 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
+#include <string>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -38,23 +40,26 @@ struct WindowContext {
 	[[nodiscard]] static vk::PhysicalDeviceVulkan12Features RequiredVulkan12Features() noexcept;
 	[[nodiscard]] static vk::PhysicalDeviceVulkan13Features RequiredVulkan13Features() noexcept;
 	[[nodiscard]] static uint32_t InitialWindowFlags(bool fullscreen) noexcept;
-	void                                                    CreateVulkan();
-	void                                                    RecreateSurface();
-	void                                                    RefreshSurfaceCapabilities();
-	void                                                    UpdateIcon();
-	void                                                    UpdateTitle();
-	void                                                    Resize(uint32_t width, uint32_t height);
-	void ProcessWindowEvent(const SDL_WindowEvent& event);
-	void ProcessDisplayEvent(const SDL_DisplayEvent& event);
-	void ProcessEvent(double time_seconds);
-	void Run();
+	void                          CreateVulkan();
+	void                          RecreateSurface();
+	void                          RefreshSurfaceCapabilities();
+	void                          UpdateIcon();
+	void                          UpdateTitle();
+	void                          Resize(uint32_t width, uint32_t height);
+	void                          ProcessWindowEvent(const SDL_WindowEvent& event);
+	void                          ProcessDisplayEvent(const SDL_DisplayEvent& event);
+	void                          ProcessEvent(double time_seconds);
+	void                          Run();
 	// SDL window operations must complete on the main thread.
 	void RunOnMainThread(std::function<void()> task);
+	// Queues the window title for the main thread without waiting for it: the main loop can take
+	// hundreds of milliseconds to wake up, and the presenter calls this once per frame.
+	void PostTitle(std::string text);
 	void DrainMainThreadTasks();
 
 	GraphicContext                 graphic_ctx;
-	SDL_Window*                    window        = nullptr;
-	vk::SurfaceKHR                 surface       = nullptr;
+	SDL_Window*                    window  = nullptr;
+	vk::SurfaceKHR                 surface = nullptr;
 	SurfaceCapabilities            surface_capabilities;
 	std::unique_ptr<RenderContext> render_context;
 	std::unique_ptr<Presenter>     presenter;
@@ -67,6 +72,7 @@ struct WindowContext {
 	std::vector<std::function<void()>> main_tasks;            // guarded by main_task_mutex
 	uint64_t                           main_tasks_queued = 0; // guarded by main_task_mutex
 	uint64_t                           main_tasks_run    = 0; // guarded by main_task_mutex
+	std::optional<std::string>         pending_title;         // guarded by main_task_mutex
 };
 
 } // namespace Libs::Graphics

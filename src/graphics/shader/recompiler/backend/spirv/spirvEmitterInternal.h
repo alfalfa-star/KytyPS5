@@ -101,18 +101,25 @@ struct EmitterState {
 		// An arena entry's own end, in dwords from the binding start (0 when unbounded).
 		uint32_t length_limit = 0;
 	} indirect_buffer;
-	uint32_t                                       bda_pagetable_variable       = 0;
-	uint32_t                                       fault_buffer_variable        = 0;
-	uint32_t                                       bda_pointer_function         = 0;
-	uint32_t                                       gds_variable                 = 0;
-	uint32_t                                       gds_length                   = 0;
-	uint32_t                                       push_constant_variable       = 0;
-	uint32_t                                       shader_data_storage_variable = 0;
-	uint32_t                                       flattened_srt_variable       = 0;
-	uint32_t                                       lds_variable                 = 0;
-	std::array<uint32_t, 2>                        scratch_variable {};
-	std::array<uint32_t, IR::ImageBindingCount>    image_variables {};
-	uint32_t                                       sampler_variable                      = 0;
+	uint32_t                                    bda_pagetable_variable       = 0;
+	uint32_t                                    fault_buffer_variable        = 0;
+	uint32_t                                    bda_pointer_function         = 0;
+	uint32_t                                    gds_variable                 = 0;
+	uint32_t                                    gds_length                   = 0;
+	uint32_t                                    push_constant_variable       = 0;
+	uint32_t                                    shader_data_storage_variable = 0;
+	uint32_t                                    flattened_srt_variable       = 0;
+	uint32_t                                    lds_variable                 = 0;
+	std::array<uint32_t, 2>                     scratch_variable {};
+	std::array<uint32_t, IR::ImageBindingCount> image_variables {};
+	uint32_t                                    sampler_variable = 0;
+	// Bindless heap (descriptor set 1) and the slots the current image access resolved to.
+	std::array<uint32_t, 3>                        bindless_image_variables {};
+	uint32_t                                       bindless_sampler_variable             = 0;
+	uint32_t                                       bindless_table_variable               = 0;
+	uint32_t                                       bindless_feedback_variable            = 0;
+	uint32_t                                       bindless_image_slot                   = 0;
+	uint32_t                                       bindless_sampler_slot                 = 0;
 	uint32_t                                       main_func                             = 0;
 	uint32_t                                       mesh_guest_func                       = 0;
 	uint32_t                                       mesh_allocation                       = 0;
@@ -305,6 +312,10 @@ uint32_t LoadSampledImageDescriptor(EmitterState& state, uint32_t resource);
 uint32_t LoadSamplerDescriptor(EmitterState& state, uint32_t sampler);
 
 uint32_t MakeSampledImage(EmitterState& state, uint32_t resource, uint32_t sampler);
+// Finds a runtime descriptor in the bindless table; misses return slot 0 and are logged.
+uint32_t               EmitBindlessLookup(EmitterState& state, uint32_t kind,
+                                          const std::array<uint32_t, 8>& dwords);
+[[nodiscard]] uint32_t BindlessImageArrayIndex(Decoder::ImageDimension dimension);
 
 uint32_t StorageImageDescriptorPointer(EmitterState& state, uint32_t resource);
 

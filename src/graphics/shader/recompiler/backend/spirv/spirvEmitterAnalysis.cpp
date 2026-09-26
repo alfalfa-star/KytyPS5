@@ -144,9 +144,135 @@ uint32_t ImageViewSizeType(EmitterState& state, ImageDimension dimension) {
 	}
 }
 
+uint32_t BindlessImageArrayIndex(Decoder::ImageDimension dimension) {
+	switch (dimension) {
+		case Decoder::ImageDimension::Dim2D: return 0u;
+		case Decoder::ImageDimension::Dim2DArray: return 1u;
+		case Decoder::ImageDimension::Dim3D: return 2u;
+		default:
+			EXIT("bindless image has unsupported dimension %u\n", static_cast<uint32_t>(dimension));
+	}
+}
+
+namespace {
+
+void DecorateNonUniform(EmitterState& state, uint32_t id) {
+	state.builder.AddAnnotation(spv::OpDecorate, id, spv::DecorationNonUniform);
+}
+
+uint32_t BindlessWordPointer(EmitterState& state, uint32_t variable, uint32_t index) {
+	const auto pointer = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(state), pointer,
+	                          variable, ConstantU32(state, 0), index);
+	return pointer;
+}
+
+uint32_t LoadBindlessWord(EmitterState& state, uint32_t variable, uint32_t index) {
+	const auto value = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpLoad, TypeU32(state), value,
+	                          BindlessWordPointer(state, variable, index));
+	return value;
+}
+
+// Loads element `slot` of a UniformConstant descriptor array.
+uint32_t LoadBindlessDescriptor(EmitterState& state, uint32_t variable, uint32_t type,
+                                uint32_t slot) {
+	const auto pointer_type =
+	    state.builder.Type(spv::OpTypePointer, spv::StorageClassUniformConstant, type);
+	const auto pointer = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpAccessChain, pointer_type, pointer, variable, slot);
+	DecorateNonUniform(state, pointer);
+	const auto value = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpLoad, type, value, pointer);
+	DecorateNonUniform(state, value);
+	return value;
+}
+
+} // namespace
+
+uint32_t EmitBindlessLookup(EmitterState& state, uint32_t kind,
+                            const std::array<uint32_t, 8>& dwords) {
+	namespace Bindless = IR::Bindless;
+	EXIT_IF(state.bindless_table_variable == 0 || state.bindless_feedback_variable == 0);
+	const auto u32  = TypeU32(state);
+	const auto C    = [&](uint32_t value) { return ConstantU32(state, value); };
+	const auto mask = C(Bindless::TableEntries - 1u);
+	// Bindless::Hash
+	auto hash = C(0x811c9dc5u ^ kind);
+	for (const auto dword: dwords) {
+		hash = Binary(state, spv::OpIMul, u32, Binary(state, spv::OpBitwiseXor, u32, hash, dword),
+		              C(0x01000193u));
+	}
+	hash       = Binary(state, spv::OpBitwiseAnd, u32,
+	                    Binary(state, spv::OpBitwiseXor, u32, hash,
+	                           Binary(state, spv::OpShiftRightLogical, u32, hash, C(15u))),
+	                    mask);
+	auto slot  = C(0u);
+	auto found = C(0u);
+	for (uint32_t probe = 0; probe < Bindless::Probes; probe++) {
+		const auto entry = Binary(state, spv::OpBitwiseAnd, u32,
+		                          Binary(state, spv::OpIAdd, u32, hash, C(probe)), mask);
+		const auto base  = Binary(state, spv::OpIMul, u32, entry, C(Bindless::EntryWords));
+		const auto word  = [&](uint32_t offset) {
+			return LoadBindlessWord(state, state.bindless_table_variable,
+			                        Binary(state, spv::OpIAdd, u32, base, C(offset)));
+		};
+		auto match = Binary(state, spv::OpIEqual, TypeBool(state), word(0u), C(kind));
+		for (uint32_t index = 0; index < 8u; index++) {
+			match = Binary(
+			    state, spv::OpLogicalAnd, TypeBool(state), match,
+			    Binary(state, spv::OpIEqual, TypeBool(state), word(2u + index), dwords[index]));
+		}
+		const auto first     = Binary(state, spv::OpLogicalAnd, TypeBool(state), match,
+		                              Binary(state, spv::OpIEqual, TypeBool(state), found, C(0u)));
+		const auto next_slot = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpSelect, u32, next_slot, first, word(1u), slot);
+		slot                  = next_slot;
+		const auto next_found = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpSelect, u32, next_found, match, C(1u), found);
+		found = next_found;
+	}
+	const auto miss = Binary(state, spv::OpIEqual, TypeBool(state), found, C(0u));
+	EmitIfCondition(state, miss, [&]() {
+		const auto count = state.builder.AllocateId();
+		state.builder.AddFunction(
+		    spv::OpAtomicIAdd, u32, count,
+		    BindlessWordPointer(state, state.bindless_feedback_variable, C(0u)),
+		    C(spv::ScopeDevice), C(0u), C(1u));
+		const auto last  = C(Bindless::FeedbackEntries - 1u);
+		const auto index = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpSelect, u32, index,
+		                          Binary(state, spv::OpULessThan, TypeBool(state), count, last),
+		                          count, last);
+		const auto base =
+		    Binary(state, spv::OpIAdd, u32, C(1u),
+		           Binary(state, spv::OpIMul, u32, index, C(Bindless::FeedbackWords)));
+		const auto store = [&](uint32_t offset, uint32_t value) {
+			state.builder.AddFunction(
+			    spv::OpStore,
+			    BindlessWordPointer(state, state.bindless_feedback_variable,
+			                        Binary(state, spv::OpIAdd, u32, base, C(offset))),
+			    value);
+		};
+		for (uint32_t dword = 0; dword < 8u; dword++) {
+			store(2u + dword, dwords[dword]);
+		}
+		store(0u, C(kind)); // written last: the host takes a nonzero kind as complete
+	});
+	DecorateNonUniform(state, slot);
+	return slot;
+}
+
 uint32_t LoadSampledImageDescriptor(EmitterState& state, uint32_t resource) {
 	const auto& image_resource = state.program.info.images.at(resource);
 	EXIT_IF(image_resource.resource_class != IR::ImageResourceClass::Sampled);
+	if (image_resource.bindless) {
+		EXIT_IF(state.bindless_image_slot == 0);
+		return LoadBindlessDescriptor(
+		    state,
+		    state.bindless_image_variables[BindlessImageArrayIndex(image_resource.dimension)],
+		    ImageType(state, image_resource), state.bindless_image_slot);
+	}
 	const auto kind = IR::DescriptorBindingForImage(image_resource);
 	EXIT_IF(!kind.has_value());
 	const auto array_index  = ResourceForDescriptor(state, *kind, resource);
@@ -162,6 +288,12 @@ uint32_t LoadSampledImageDescriptor(EmitterState& state, uint32_t resource) {
 }
 
 uint32_t LoadSamplerDescriptor(EmitterState& state, uint32_t sampler) {
+	if (state.program.info.samplers.at(sampler).bindless) {
+		EXIT_IF(state.bindless_sampler_slot == 0);
+		return LoadBindlessDescriptor(state, state.bindless_sampler_variable,
+		                              state.builder.Type(spv::OpTypeSampler),
+		                              state.bindless_sampler_slot);
+	}
 	const auto array_index =
 	    ResourceForDescriptor(state, IR::DescriptorBindingKind::Samplers, sampler);
 	const auto sampler_type = state.builder.Type(spv::OpTypeSampler);
@@ -179,10 +311,13 @@ uint32_t MakeSampledImage(EmitterState& state, uint32_t resource, uint32_t sampl
 	const auto& image_resource = state.program.info.images.at(resource);
 	const auto  image          = LoadSampledImageDescriptor(state, resource);
 	const auto  sampler_id     = LoadSamplerDescriptor(state, sampler);
-	const auto  sampled_image = state.builder.AllocateId();
+	const auto  sampled_image  = state.builder.AllocateId();
 	const auto  sampled_type =
 	    state.builder.Type(spv::OpTypeSampledImage, ImageType(state, image_resource));
 	state.builder.AddFunction(spv::OpSampledImage, sampled_type, sampled_image, image, sampler_id);
+	if (image_resource.bindless || state.program.info.samplers.at(sampler).bindless) {
+		DecorateNonUniform(state, sampled_image);
+	}
 	return sampled_image;
 }
 

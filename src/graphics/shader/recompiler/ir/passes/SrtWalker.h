@@ -10,6 +10,8 @@ namespace Libs::Graphics::ShaderRecompiler::IR {
 class Value;
 
 using SrtMemoryReader = bool (*)(void* userdata, uint64_t address, uint32_t* value);
+// True when only the GPU holds the current value of the dword at address (in a buffer).
+using SrtGpuOwnedQuery = bool (*)(void* userdata, uint64_t address);
 
 struct SrtRuntime {
 	std::span<const uint32_t> user_data;
@@ -17,6 +19,9 @@ struct SrtRuntime {
 	SrtMemoryReader           read_memory                = nullptr;
 	void*                     userdata                   = nullptr;
 	SrtMemoryReader           read_specialization_memory = nullptr;
+	// Optional: flattened SRT words the host never evaluates itself and the GPU owns are
+	// returned as GpuFlatRead records instead of being read.
+	SrtGpuOwnedQuery gpu_owned = nullptr;
 };
 
 enum class RuntimeValueType { Any, Integer };
@@ -27,7 +32,7 @@ void BuildSrtPlan(Program& program);
 bool ValidateRuntimeValue(const ResourcePlan& program, Value value,
                           RuntimeValueType type = RuntimeValueType::Any);
 bool EvaluateUniformValues(const ResourcePlan& program, std::span<const Value> values,
-                            const SrtRuntime& runtime, std::span<uint32_t> results);
+                           const SrtRuntime& runtime, std::span<uint32_t> results);
 
 bool EvaluateDescriptorSource(const ResourcePlan& program, uint32_t source,
                               const SrtRuntime& runtime, DescriptorValue& result);
@@ -42,10 +47,10 @@ bool EvaluateDescriptorSources(const ResourcePlan& program, std::span<const uint
 bool EvaluateRuntimeSources(const ResourcePlan& program, std::span<const uint32_t> sources,
                             const SrtRuntime& runtime, std::vector<DescriptorValue>& results,
                             std::vector<uint32_t>& flat, std::span<const uint8_t> clean_flat_slots,
-                            std::vector<uint8_t>& active_sources);
+                            std::vector<uint8_t>&     active_sources,
+                            std::vector<GpuFlatRead>* gpu_flat_reads = nullptr);
 
-bool WalkSrt(const ResourcePlan& program, const SrtRuntime& runtime,
-             std::vector<uint32_t>& flat);
+bool WalkSrt(const ResourcePlan& program, const SrtRuntime& runtime, std::vector<uint32_t>& flat);
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR
 

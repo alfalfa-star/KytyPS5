@@ -1,18 +1,24 @@
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 
 #include "common/assert.h"
+#include "common/perfTmp.h" // PERFTMP
 #include "graphics/guest_gpu/gpu_format.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
+#include "graphics/shader/recompiler/ir/passes/SrtCompiler.h"
 #include "graphics/shader/shaderBindings.h"
 
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <chrono> // PERFTMP
+#include <cinttypes>
 #include <cstdio>
 #include <cstring>
 #include <fmt/format.h>
 #include <functional>
+#include <mutex> // PERFTMP
 #include <numeric>
+#include <unordered_map>
 #include <unordered_set>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
@@ -40,6 +46,19 @@ struct MaterializedSnapshot {
 	std::vector<IndirectTable> indirect_images;
 	std::vector<IndirectTable> indirect_buffers;
 };
+
+struct DescriptorValueHash {
+	size_t operator()(const DescriptorValue& value) const {
+		uint64_t hash = 0xcbf29ce484222325ull ^ value.dword_count;
+		for (const auto dword: value.dwords) {
+			hash = (hash ^ dword) * 0x100000001b3ull;
+		}
+		return static_cast<size_t>(hash ^ (hash >> 32u));
+	}
+};
+
+// Tables can hold thousands of entries; index the distinct descriptors instead of scanning.
+using DescriptorIndex = std::unordered_map<DescriptorValue, uint32_t, DescriptorValueHash>;
 
 bool SpecializationFail(std::string_view message) {
 	std::fprintf(stderr, "shader resource specialization failed: %.*s\n",
@@ -330,6 +349,12 @@ bool MaterializeIndirectTable(const DescriptorSource::IndirectTable& indirect,
 		ShaderBufferResource material;
 		if (!DecodeBufferDescriptor(material_value, material) ||
 		    material.Stride() != indirect.selector_stride) {
+			std::fprintf(stderr,
+			             "PERFTMP table material V# stride=%u selector_stride=%u words=%08x %08x "
+			             "%08x %08x\n", // PERFTMP
+			             material.Stride(), indirect.selector_stride, material_value.dwords[0],
+			             material_value.dwords[1], material_value.dwords[2],
+			             material_value.dwords[3]);
 			return false;
 		}
 
@@ -342,23 +367,39 @@ bool MaterializeIndirectTable(const DescriptorSource::IndirectTable& indirect,
 		const auto limit       = std::min<uint64_t>(UINT32_MAX, size + 3u);
 		const auto probe_count = residue <= limit ? (limit - residue) / step + 1u : 0u;
 		if (probe_count > MaxIndirectImageProbes) {
-			return false;
-		}
-
-		std::unordered_set<uint32_t> seen {0u};
-		keys.reserve(static_cast<size_t>(probe_count) + 1u);
-		seen.reserve(static_cast<size_t>(probe_count) + 1u);
-		for (uint64_t offset = residue; offset <= limit && probe_count != 0u; offset += step) {
-			uint32_t key = 0;
-			if (!ReadScalarBufferWord(material, static_cast<uint32_t>(offset),
-			                          indirect.material_offset, runtime, key)) {
+			// Too many keys to read per draw (e.g. a per-instance index array): every key the
+			// shader can select addresses one heap entry, so enumerate the heap V# instead.
+			constexpr uint64_t MaxHeapEntries = 16384u;
+			const uint64_t     heap_size      = heap_address ? 0u : heap.GetSize();
+			const uint64_t     entries =
+			    heap_size > record_offset
+			        ? (heap_size - record_offset + entry_stride - 1u) / entry_stride
+			        : 0u;
+			if (heap_address || entries == 0u || entries > MaxHeapEntries) {
 				return false;
 			}
-			if (seen.insert(key).second) {
-				keys.push_back(key);
-			}
-			if (limit - offset < step) {
-				break;
+			keys.resize(static_cast<size_t>(entries));
+			std::iota(keys.begin(), keys.end(), 0u);
+		} else {
+			std::unordered_set<uint32_t> seen {0u};
+			keys.reserve(static_cast<size_t>(probe_count) + 1u);
+			seen.reserve(static_cast<size_t>(probe_count) + 1u);
+			for (uint64_t offset = residue; offset <= limit && probe_count != 0u; offset += step) {
+				uint32_t key = 0;
+				if (!ReadScalarBufferWord(material, static_cast<uint32_t>(offset),
+				                          indirect.material_offset, runtime, key)) {
+					std::fprintf(
+					    stderr,
+					    "PERFTMP table material read failed offset=%llu base=%llx\n", // PERFTMP
+					    (unsigned long long)offset, (unsigned long long)material.Base48());
+					return false;
+				}
+				if (seen.insert(key).second) {
+					keys.push_back(key);
+				}
+				if (limit - offset < step) {
+					break;
+				}
 			}
 		}
 	}
@@ -374,7 +415,8 @@ bool MaterializeIndirectTable(const DescriptorSource::IndirectTable& indirect,
 	// A bounded key range is only an upper bound on the table: the shader never reads past
 	// the entries the game filled in, which sit densely from key 0, so the first entry that is
 	// not a descriptor ends the table and everything after it is unrelated memory.
-	bool table_ended = false;
+	bool            table_ended = false;
+	DescriptorIndex index;
 	for (const auto key: next.keys) {
 		DescriptorValue candidate;
 		candidate.dword_count = entry_dwords;
@@ -388,6 +430,11 @@ bool MaterializeIndirectTable(const DescriptorSource::IndirectTable& indirect,
 				}
 			}
 		}
+		if (r128 && entry_dwords == 8u) {
+			// Only the first four dwords of each entry form an r128 T#; the rest of the record
+			// is other data.
+			std::fill(candidate.dwords.begin() + 4, candidate.dwords.end(), 0u);
+		}
 		const bool valid =
 		    indirect.sampler ? !NullBufferDescriptor(candidate)
 		    : entry_dwords == 8u
@@ -399,16 +446,18 @@ bool MaterializeIndirectTable(const DescriptorSource::IndirectTable& indirect,
 			// A heap-bounded table is sized by the heap itself and may have holes.
 			table_ended = table_ended || (indirect.key_count != 0u && !indirect.heap_bounded);
 		}
-		const auto found = std::ranges::find(next.descriptors, candidate);
-		if (found == next.descriptors.end()) {
+		const auto found = index.find(candidate);
+		if (found == index.end()) {
 			if (next.descriptors.size() >= max_resources) {
 				return SpecializationFail(fmt::format(
 				    "indirect table has more than {} distinct descriptors", max_resources));
 			}
+			const auto slot = static_cast<uint32_t>(next.descriptors.size());
+			index.emplace(candidate, slot);
 			next.descriptors.push_back(candidate);
-			next.candidates.push_back(static_cast<uint32_t>(next.descriptors.size() - 1u));
+			next.candidates.push_back(slot);
 		} else {
-			next.candidates.push_back(static_cast<uint32_t>(found - next.descriptors.begin()));
+			next.candidates.push_back(found->second);
 		}
 	}
 	result = std::move(next);
@@ -425,7 +474,8 @@ bool MaterializeSelectTable(const ResourcePlan&                    program,
 	if (!EvaluateDescriptorSources(program, indirect.candidate_sources, runtime, values)) {
 		return SpecializationFail("select table candidates could not be evaluated");
 	}
-	IndirectTable next;
+	IndirectTable   next;
+	DescriptorIndex index;
 	for (uint32_t key = 0; key < values.size(); key++) {
 		auto candidate        = values[key];
 		candidate.dword_count = indirect.entry_dwords;
@@ -438,13 +488,12 @@ bool MaterializeSelectTable(const ResourcePlan&                    program,
 			candidate.dwords.fill(0);
 		}
 		next.keys.push_back(key);
-		const auto found = std::ranges::find(next.descriptors, candidate);
-		if (found == next.descriptors.end()) {
+		const auto [found, inserted] =
+		    index.emplace(candidate, static_cast<uint32_t>(next.descriptors.size()));
+		if (inserted) {
 			next.descriptors.push_back(candidate);
-			next.candidates.push_back(static_cast<uint32_t>(next.descriptors.size() - 1u));
-		} else {
-			next.candidates.push_back(static_cast<uint32_t>(found - next.descriptors.begin()));
 		}
+		next.candidates.push_back(found->second);
 	}
 	table = std::move(next);
 	return true;
@@ -497,8 +546,10 @@ static bool MaterializeSnapshot(const ResourcePlan& program, const SrtRuntime& r
 	std::vector<DescriptorValue> values;
 	std::vector<uint32_t>        flattened_srt;
 	std::vector<uint8_t>         active_sources;
+	std::vector<GpuFlatRead>     gpu_flat_reads;
 	if (!EvaluateRuntimeSources(program, program.materialization_sources, runtime, values,
-	                            flattened_srt, program.clean_flat_slots, active_sources)) {
+	                            flattened_srt, program.clean_flat_slots, active_sources,
+	                            &gpu_flat_reads)) {
 		return SpecializationFail("runtime descriptor sources could not be evaluated");
 	}
 
@@ -537,7 +588,8 @@ static bool MaterializeSnapshot(const ResourcePlan& program, const SrtRuntime& r
 			snapshot.indirect_buffers.push_back(std::move(table));
 		}
 	}
-	next.flattened_srt = std::move(flattened_srt);
+	next.flattened_srt  = std::move(flattened_srt);
+	next.gpu_flat_reads = std::move(gpu_flat_reads);
 	next.images.resize(program.info.images.size());
 	for (uint32_t image_index = 0; image_index < program.info.images.size(); image_index++) {
 		const auto& image  = program.info.images[image_index];
@@ -580,7 +632,18 @@ static bool MaterializeSnapshot(const ResourcePlan& program, const SrtRuntime& r
 		}
 		IndirectTable table;
 		if (!MaterializeTableSource(program, *source, false, runtime, table)) {
-			return false;
+			// A sampler only changes filtering; keep drawing with the default S# rather than
+			// failing the draw when the table cannot be enumerated.
+			static bool logged = false;
+			if (!logged) {
+				std::fprintf(stderr,
+				             "shader resource specialization: sampler table of shader "
+				             "0x%016" PRIx64 " could not be read; using the default "
+				             "sampler\n",
+				             program.shader_hash);
+				logged = true;
+			}
+			continue;
 		}
 		// Samplers bind statically: use the S# most entries share (material tables usually
 		// repeat one), and say so when entries disagree.
@@ -973,6 +1036,16 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, Materialize
 		if (base.resource_class == ImageResourceClass::None ||
 		    (base.atomic && base.resource_class != ImageResourceClass::Storage)) {
 			return SpecializationFail(fmt::format("image resource {} has an invalid class", i));
+		}
+		if (base.bindless) {
+			// Resolved on the GPU per access; the heap's views carry format and swizzle.
+			image.numeric_class     = Prospero::TextureNumericClass::Float;
+			image.dimension         = base.dimension;
+			image.cube              = false;
+			image.mip_count         = 1u;
+			image.conversion_format = Prospero::BufferFormat::kInvalid;
+			image.shader_swizzle    = ShaderImageIdentitySwizzle;
+			continue;
 		}
 		image.mip_count = StorageMipCount(base, descriptor);
 		if (image.mip_count == 0u) {
@@ -1555,11 +1628,41 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 	for (const auto& sampler: plan.info.samplers) {
 		mark_table_slots(sampler.source);
 	}
+	plan.compiled_srt = std::make_shared<const CompiledSrtProgram>(CompileSrtProgram(plan));
 	return plan;
 }
 
 bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
                           ResourceSnapshot& snapshot, ResourceSpecialization& specialization) {
+	PERFTMP_SCOPE(__PRETTY_FUNCTION__); // PERFTMP
+	struct PerShaderTimer {             // PERFTMP
+		uint64_t                              hash;
+		std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+		~PerShaderTimer() {
+			static std::mutex                                                  mutex;
+			static std::unordered_map<uint64_t, std::pair<uint64_t, uint64_t>> totals;
+			static auto      last = std::chrono::steady_clock::now();
+			const auto       now  = std::chrono::steady_clock::now();
+			std::scoped_lock lock(mutex);
+			auto&            t = totals[hash];
+			t.first += std::chrono::duration_cast<std::chrono::nanoseconds>(now - start).count();
+			t.second++;
+			if (now - last > std::chrono::seconds(5)) {
+				last = now;
+				std::vector<std::pair<uint64_t, std::pair<uint64_t, uint64_t>>> v(totals.begin(),
+				                                                                  totals.end());
+				std::sort(v.begin(), v.end(),
+				          [](auto& a, auto& b) { return a.second.first > b.second.first; });
+				for (size_t n = 0; n < std::min<size_t>(6, v.size()); n++) {
+					std::fprintf(stderr, "PERFTMP mat %016llx %llu ms %llu calls\n",
+					             (unsigned long long)v[n].first,
+					             (unsigned long long)(v[n].second.first / 1000000),
+					             (unsigned long long)v[n].second.second);
+				}
+				totals.clear();
+			}
+		}
+	} perftmp_timer {program.shader_hash};
 	MaterializedSnapshot materialized;
 	if (!MaterializeSnapshot(program, runtime, materialized)) {
 		return false;

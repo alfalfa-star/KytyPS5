@@ -2,10 +2,12 @@
 
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "common/perfTmp.h" // PERFTMP
 #include "graphics/host_gpu/graphicContext.h"
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib> // PERFTMP
 #include <optional>
 
 namespace Libs::Graphics {
@@ -170,6 +172,18 @@ void CommandScheduler::Flush() {
 	Flush(submit);
 }
 
+void CommandScheduler::CompleteOperation() {
+	// Measured on Ghost of Yotei: every 8 draws/dispatches cut host GPU waits by a third.
+	static const uint32_t OperationsPerSubmit = [] { // PERFTMP
+		const char* v = std::getenv("KYTY_OPS_PER_SUBMIT");
+		return v != nullptr ? static_cast<uint32_t>(std::atoi(v)) : 8u;
+	}();
+	if (++m_completed_operations >= OperationsPerSubmit && Active() && !m_command.IsInvalid()) {
+		PERFTMP_SCOPE("submit: every 8 operations"); // PERFTMP
+		Flush();
+	}
+}
+
 void CommandScheduler::Flush(SubmitInfo& submit) {
 	Submit(submit);
 	BeginNext();
@@ -192,8 +206,10 @@ void CommandScheduler::Finish() {
 }
 
 void CommandScheduler::Wait(uint64_t tick) {
+	PERFTMP_SCOPE(__PRETTY_FUNCTION__); // PERFTMP
 	EXIT_IF(tick > CurrentTick());
 	if (tick == CurrentTick()) {
+		PERFTMP_SCOPE("Wait: forced submit of current tick"); // PERFTMP
 		CheckActive();
 		// A stream-buffer wrap can wait while a draw is being prepared through a reference to
 		// Current(). The wrapper stays stable while its pooled Vulkan buffer is retired. Deferred
@@ -203,6 +219,7 @@ void CommandScheduler::Wait(uint64_t tick) {
 		m_master.Wait(tick);
 		BeginNext();
 	} else {
+		PERFTMP_SCOPE("Wait: earlier tick"); // PERFTMP
 		m_master.Wait(tick);
 	}
 }
@@ -302,6 +319,7 @@ void CommandScheduler::DrainPriorityOperations() {
 }
 
 void CommandScheduler::WaitPriorityOperations(uint64_t tick) {
+	PERFTMP_SCOPE(__PRETTY_FUNCTION__); // PERFTMP
 	EXIT_IF(g_deferred_callback_scheduler == this);
 	std::unique_lock lock(m_operation_mutex);
 	m_operation_available.wait(lock, [this, tick] {
@@ -344,7 +362,13 @@ CommandBuffer& CommandScheduler::BeginCommand() {
 }
 
 uint64_t CommandScheduler::Submit(SubmitInfo submit) {
+	PERFTMP_SCOPE(__PRETTY_FUNCTION__); // PERFTMP
 	EXIT_IF(m_command.IsInvalid());
+	if (m_pre_submit && !m_in_pre_submit) {
+		m_in_pre_submit = true;
+		m_pre_submit();
+		m_in_pre_submit = false;
+	}
 	EXIT_IF(submit.num_wait_semaphores > SubmitInfo::MaxSemaphores ||
 	        submit.num_signal_semaphores >= SubmitInfo::MaxSemaphores);
 
@@ -387,7 +411,8 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	}
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 
-	m_command.m_buffer = nullptr;
+	m_command.m_buffer     = nullptr;
+	m_completed_operations = 0;
 	return tick;
 }
 

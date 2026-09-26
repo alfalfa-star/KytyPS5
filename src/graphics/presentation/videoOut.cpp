@@ -5,6 +5,7 @@
 #include "common/common.h"
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
+#include "common/perfTmp.h" // PERFTMP
 #include "common/profiler.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
@@ -500,6 +501,7 @@ static bool IsValidFlipMode(int mode) {
 
 static int ReserveFlipRequest(VideoOutDriver::Impl& driver, int handle, int index, int flip_mode,
                               int64_t flip_arg, FlipRequestSource source, uint64_t& request_id) {
+	PERFTMP_SCOPE(__PRETTY_FUNCTION__); // PERFTMP
 	auto* video_out = driver.Get(handle);
 	if (video_out == nullptr) {
 		return VIDEO_OUT_ERROR_INVALID_HANDLE;
@@ -937,6 +939,7 @@ void FlipQueue::Cancel(VideoOutConfig& cfg) {
 }
 
 void FlipQueue::Prepare(uint64_t request_id, Graphics::CommandBuffer& buffer) {
+	PERFTMP_SCOPE(__PRETTY_FUNCTION__); // PERFTMP
 	VideoOutConfig* cfg        = nullptr;
 	uint64_t        generation = 0;
 	int             index      = 0;
@@ -1067,6 +1070,7 @@ void FlipQueue::Complete(uint64_t request_id) {
 }
 
 void FlipQueue::WaitForSubmitSlot() {
+	PERFTMP_SCOPE(__PRETTY_FUNCTION__); // PERFTMP
 	Common::LockGuard lock(m_mutex);
 	while (m_requests.size() + m_cpu_requests.size() >= VIDEO_OUT_FLIP_QUEUE_CAPACITY) {
 		if (m_requests.empty()) {
@@ -1077,6 +1081,7 @@ void FlipQueue::WaitForSubmitSlot() {
 }
 
 void FlipQueue::Wait(VideoOutConfig& cfg, int index) {
+	PERFTMP_SCOPE(__PRETTY_FUNCTION__); // PERFTMP
 	Common::LockGuard lock(m_mutex);
 
 	auto has_request = [this, &cfg, index] {
@@ -1129,7 +1134,10 @@ bool FlipQueue::Flip(uint32_t micros) {
 	m_requests.front().state = RequestState::Presenting;
 	m_mutex.Unlock();
 
-	m_presenter.Present(*r.frame);
+	{
+		PERFTMP_SCOPE("FlipQueue::Flip Present under cfg mutex"); // PERFTMP
+		m_presenter.Present(*r.frame);
+	}
 
 	m_mutex.Lock();
 	if (m_requests.empty() || m_requests.front().id != r.id ||
@@ -1464,6 +1472,13 @@ KYTY_SYSV_ABI int VideoOutSubmitFlip(int handle, int index, int flip_mode, int64
 
 int VideoOutDriver::SubmitFlipFromGpu(Graphics::CommandBuffer& buffer, int handle, int index,
                                       int flip_mode, int64_t flip_arg, uint64_t& request_id) {
+	if (PerfTmp::TraceFrame()) { // PERFTMP
+		std::fprintf(stderr, "TRACE flip=%u index=%d\n", PerfTmp::FlipCounter().load(), index);
+	}
+	if ((PerfTmp::FlipCounter()++ % 50u) == 0u) { // PERFTMP
+		LOGF("PERFTMP flip %u\n", PerfTmp::FlipCounter().load());
+	}
+	PERFTMP_SCOPE(__PRETTY_FUNCTION__); // PERFTMP
 	EXIT_IF(buffer.IsInvalid());
 
 	const int result = ReserveFlipRequest(*m_impl, handle, index, flip_mode, flip_arg,

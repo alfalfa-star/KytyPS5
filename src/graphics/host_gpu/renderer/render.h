@@ -4,6 +4,7 @@
 #include "common/abi.h"
 #include "common/assert.h"
 #include "common/common.h"
+#include "graphics/host_gpu/renderer/pipeline/bindlessHeap.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
@@ -156,6 +157,11 @@ public:
 
 	void DispatchDirect(uint64_t submit_id, CommandBuffer& buffer, uint32_t thread_group_x,
 	                    uint32_t thread_group_y, uint32_t thread_group_z, uint32_t mode);
+	// Dispatches with the group counts the GPU reads from guest memory, so GPU-written counts
+	// need no CPU readback. False when the dispatch needs its counts on the CPU (thread
+	// dimensions, fill and clear recognition); the caller then dispatches them directly.
+	[[nodiscard]] bool DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
+	                                    uint64_t args_address, uint32_t mode);
 
 	[[nodiscard]] PreparedBindings PrepareBindings(const ShaderStageRuntime& runtime);
 	void                           FindBuffers(PreparedBindings& bindings);
@@ -176,34 +182,51 @@ private:
 
 	[[nodiscard]] TextureBinding ResolveTexture(const ShaderRecompiler::IR::ImageResource& resource,
 	                                            const ShaderRecompiler::IR::DescriptorValue& value);
+	// Bindless heap (BindlessHeap): registers what shaders reported missing and keeps the
+	// registered textures current. Runs while resources may still touch guest memory.
+	void               PrepareBindless();
+	void               RegisterBindless(const BindlessHeap::Key& key);
+	[[nodiscard]] bool ResolveBindlessImage(const BindlessHeap::Key& key, ImageId& image,
+	                                        vk::ImageView& view);
+	void               InitBindlessNullDescriptors();
+	// Puts the registered textures in the layout the heap names (GENERAL).
+	void TransitBindless(vk::CommandBuffer command_buffer);
 	void PrepareGraphicsBindings(std::span<PreparedBindings* const> stages,
-	                             std::span<RenderColorInfo> colors);
+	                             std::span<RenderColorInfo>         colors);
 	void ResolveRenderColorTarget(CommandBuffer& buffer, RenderColorInfo& target,
 	                              uint32_t render_target_slice_offset, uint32_t render_target_slot,
 	                              bool ignore_target_mask = false, bool exact_format = false);
 	void ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepthInfo& target);
 	[[nodiscard]] bool DepthStencilCopy(CommandBuffer& buffer);
-	[[nodiscard]] bool PrepareDrawRenderState(CommandBuffer& buffer,
-	                                          const DrawCallInfo& draw,
-	                                          uint32_t            render_target_slice_offset,
+	[[nodiscard]] bool PrepareDrawRenderState(CommandBuffer& buffer, const DrawCallInfo& draw,
+	                                          uint32_t         render_target_slice_offset,
 	                                          DrawRenderState& state);
 	void ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buffer, const DrawCallInfo& draw,
 	                         DrawRenderState& state, vk::PrimitiveTopology topology,
 	                         const DrawEmitInfo& emit, const DrawIndexBufferSource& index_source,
 	                         bool primitive_restart_enable);
-	[[nodiscard]] RenderState AcquireRenderTargets(CommandBuffer& buffer, RenderColorInfo* colors,
-	                                               uint32_t color_count, RenderDepthInfo& depth,
-	                                               const std::optional<PreparedBindings>& pixel = std::nullopt);
-	[[nodiscard]] bool        ResolveColorTargets(CommandBuffer& buffer,
-	                                              uint32_t render_target_slice_offset);
-	void                      BindImage(ImageId id, bool storage);
-	void                      BindRenderTarget(ImageId id);
-	void                      ResetBindings();
-	[[nodiscard]] bool        TryConsumeComputeMetaClear(const ShaderComputeInputInfo& input,
-	                                                     const CommandBuffer&          buffer);
+	[[nodiscard]] RenderState
+	AcquireRenderTargets(CommandBuffer& buffer, RenderColorInfo* colors, uint32_t color_count,
+	                     RenderDepthInfo&                       depth,
+	                     const std::optional<PreparedBindings>& pixel = std::nullopt);
+	[[nodiscard]] bool ResolveColorTargets(CommandBuffer& buffer,
+	                                       uint32_t       render_target_slice_offset);
+	void               BindImage(ImageId id, bool storage);
+	void               BindRenderTarget(ImageId id);
+	void               ResetBindings();
+	bool               Dispatch(uint64_t submit_id, CommandBuffer& buffer, uint32_t thread_group_x,
+	                            uint32_t thread_group_y, uint32_t thread_group_z, uint32_t mode,
+	                            uint64_t indirect_args);
+	[[nodiscard]] bool TryConsumeComputeMetaClear(const ShaderComputeInputInfo& input,
+	                                              const CommandBuffer&          buffer);
 	[[nodiscard]] bool TryConsumeComputeImageClear(const ShaderComputeInputInfo& input,
-	                                              CommandBuffer& command, uint32_t group_x,
-	                                              uint32_t group_y, uint32_t group_z, uint32_t mode);
+	                                               CommandBuffer& command, uint32_t group_x,
+	                                               uint32_t group_y, uint32_t group_z,
+	                                               uint32_t mode);
+	[[nodiscard]] bool TryConsumeComputeMetadataFill(const ShaderComputeInputInfo& input,
+	                                                 CommandBuffer& command, uint32_t group_x,
+	                                                 uint32_t group_y, uint32_t group_z,
+	                                                 uint32_t mode);
 
 	RenderContext&                        m_context;
 	std::vector<ImageId>                  m_bound_images;

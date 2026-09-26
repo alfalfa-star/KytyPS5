@@ -14,8 +14,12 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono> // PERFTMP
 #include <cmath>
+#include <cstdlib> // PERFTMP
+#include <cstring> // PERFTMP
 #include <cstring>
+#include <vector> // PERFTMP
 #include <vector>
 
 namespace Libs::Controller {
@@ -85,10 +89,10 @@ struct ControllerState {
 		uint16_t y    = 0;
 	};
 
-	uint64_t time                                  = 0;
-	uint32_t buttons                               = 0;
-	int      axes[static_cast<int>(Axis::AxisMax)] = {128, 128, 128, 128, 0, 0};
-	Touch    touch[2];
+	uint64_t             time                                  = 0;
+	uint32_t             buttons                               = 0;
+	int                  axes[static_cast<int>(Axis::AxisMax)] = {128, 128, 128, 128, 0, 0};
+	Touch                touch[2];
 	std::array<float, 3> accel {0.0f, 1.0f, 0.0f};
 	std::array<float, 3> gyro {};
 	std::array<float, 4> orientation {0.0f, 0.0f, 0.0f, 1.0f};
@@ -141,19 +145,47 @@ private:
 
 static GameController* g_controller = nullptr;
 
+static uint32_t AutoPressTmp() { // PERFTMP
+	static std::vector<double> times = [] {
+		std::vector<double> v;
+		const char*         e = std::getenv("KYTY_AUTOPRESS");
+		for (const char* p = e; p != nullptr && *p != 0;) {
+			v.push_back(std::atof(p));
+			p = std::strchr(p, ',');
+			if (p) p++;
+		}
+		return v;
+	}();
+	static const auto start = std::chrono::steady_clock::now();
+	const double      t =
+	    std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+	// KYTY_AUTOPRESS_PERIOD_MS=N: press Cross for the first half of every N ms.
+	static const double period = [] {
+		const char* e = std::getenv("KYTY_AUTOPRESS_PERIOD_MS");
+		return e != nullptr ? std::atof(e) / 1000.0 : 0.0;
+	}();
+	if (period > 0.0 && std::fmod(t, period) < period / 2.0) {
+		return PAD_BUTTON_CROSS;
+	}
+	for (const auto s: times) {
+		if (t >= s && t < s + 0.3) return PAD_BUTTON_CROSS;
+	}
+	return 0;
+}
+
 static void pad_fill_data(PadData* data, const ControllerState& state, bool connected,
                           int connected_count) {
 	EXIT_IF(data == nullptr);
 
 	std::memset(data, 0, sizeof(*data));
 
-	data->buttons           = state.buttons;
-	data->left_stick_x      = state.axes[static_cast<int>(Axis::LeftX)];
-	data->left_stick_y      = state.axes[static_cast<int>(Axis::LeftY)];
-	data->right_stick_x     = state.axes[static_cast<int>(Axis::RightX)];
-	data->right_stick_y     = state.axes[static_cast<int>(Axis::RightY)];
-	data->analog_buttons_l2 = state.axes[static_cast<int>(Axis::TriggerLeft)];
-	data->analog_buttons_r2 = state.axes[static_cast<int>(Axis::TriggerRight)];
+	data->buttons            = state.buttons | AutoPressTmp(); // PERFTMP
+	data->left_stick_x       = state.axes[static_cast<int>(Axis::LeftX)];
+	data->left_stick_y       = state.axes[static_cast<int>(Axis::LeftY)];
+	data->right_stick_x      = state.axes[static_cast<int>(Axis::RightX)];
+	data->right_stick_y      = state.axes[static_cast<int>(Axis::RightY)];
+	data->analog_buttons_l2  = state.axes[static_cast<int>(Axis::TriggerLeft)];
+	data->analog_buttons_r2  = state.axes[static_cast<int>(Axis::TriggerRight)];
 	data->acceleration_x     = state.accel[0];
 	data->acceleration_y     = state.accel[1];
 	data->acceleration_z     = state.accel[2];
@@ -528,7 +560,7 @@ void GameController::ReleaseHostPads() {
 		    pad != nullptr) {
 			if (SDL_GameControllerGetType(pad) == SDL_CONTROLLER_TYPE_PS5) {
 				DualSenseEffects effect {};
-				effect.enable_bits     = 0x0c;
+				effect.enable_bits      = 0x0c;
 				effect.right_trigger[0] = 0x05;
 				effect.left_trigger[0]  = 0x05;
 				(void)SDL_GameControllerSendEffect(pad, &effect, sizeof(effect));

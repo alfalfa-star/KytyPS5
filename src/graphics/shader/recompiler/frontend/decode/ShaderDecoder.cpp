@@ -584,6 +584,7 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::IMAGE_LOAD_MIP:
 		case Opcode::IMAGE_GET_RESINFO:
 		case Opcode::IMAGE_GET_LOD:
+		case Opcode::IMAGE_BVH_INTERSECT_RAY:
 		case Opcode::IMAGE_GATHER4_L:
 		case Opcode::IMAGE_GATHER4_LZ:
 		case Opcode::IMAGE_GATHER4_C:

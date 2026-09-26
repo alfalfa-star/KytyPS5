@@ -3,6 +3,7 @@
 #include "common/assert.h"
 
 #include <algorithm>
+#include <bit>
 #include <fmt/format.h>
 #include <iterator>
 #include <map>
@@ -572,15 +573,6 @@ bool IsValidTarget(uint32_t target, const std::set<uint32_t>& instruction_pcs, u
 	return target == end_pc || (target >= first_pc && instruction_pcs.contains(target));
 }
 
-std::vector<uint32_t> AllBlockIds(uint32_t count) {
-	std::vector<uint32_t> ids;
-	ids.reserve(count);
-	for (uint32_t i = 0; i < count; i++) {
-		ids.push_back(i);
-	}
-	return ids;
-}
-
 std::vector<uint32_t> IntersectSorted(const std::vector<uint32_t>& a,
                                       const std::vector<uint32_t>& b) {
 	std::vector<uint32_t> ret;
@@ -719,66 +711,102 @@ void PruneUnreachableBlocks(Graph& graph) {
 	RebuildPredecessors(graph);
 }
 
-void ComputeDominators(Graph& graph) {
+// Solves (post-)dominance as the greatest fixpoint of dom(b) = {b} + intersection over dom of
+// b's predecessors (successors for post-dominance), with the entry block (dominance) and blocks
+// without predecessors (successors) fixed to themselves. The greatest fixpoint does not depend
+// on visiting order, so sets are word-parallel bitsets swept in depth-first order.
+void SolveDominance(Graph& graph, bool post) {
 	const auto count = static_cast<uint32_t>(graph.blocks.size());
-	const auto all   = AllBlockIds(count);
-
-	for (auto& block: graph.blocks) {
-		block.dominators = (block.id == graph.entry_block ? std::vector<uint32_t> {block.id} : all);
+	if (count == 0) {
+		return;
+	}
+	const size_t words = (count + 63u) / 64u;
+	const auto   tail_mask =
+	    (count % 64u) == 0u ? ~uint64_t {0} : (uint64_t {1} << (count % 64u)) - 1u;
+	std::vector<uint64_t> sets(words * count, ~uint64_t {0});
+	std::vector<bool>     fixed(count, false);
+	const auto            edges = [&](const BasicBlock& block) -> const std::vector<uint32_t>& {
+		return post ? block.successors : block.predecessors;
+	};
+	for (uint32_t id = 0; id < count; id++) {
+		auto* set = &sets[id * words];
+		set[words - 1u] &= tail_mask;
+		const auto& block = graph.blocks[id];
+		if ((!post && id == graph.entry_block) || edges(block).empty()) {
+			std::fill(set, set + words, 0);
+			set[id / 64u] |= uint64_t {1} << (id % 64u);
+			fixed[id] = true;
+		}
 	}
 
-	bool changed = true;
-	while (changed) {
-		changed = false;
-		for (auto& block: graph.blocks) {
-			if (block.id == graph.entry_block) {
+	// Forward depth-first post-order: reversed it visits predecessors first (dominance), as is
+	// it roughly visits successors first (post-dominance).
+	std::vector<uint32_t>                      order;
+	std::vector<bool>                          visited(count, false);
+	std::vector<std::pair<uint32_t, uint32_t>> stack;
+	order.reserve(count);
+	const auto visit = [&](uint32_t root) {
+		if (root >= count || visited[root]) {
+			return;
+		}
+		visited[root] = true;
+		stack.emplace_back(root, 0u);
+		while (!stack.empty()) {
+			auto& [id, next]       = stack.back();
+			const auto& successors = graph.blocks[id].successors;
+			if (next < successors.size()) {
+				const auto succ = successors[next++];
+				if (succ < count && !visited[succ]) {
+					visited[succ] = true;
+					stack.emplace_back(succ, 0u);
+				}
 				continue;
 			}
-			std::vector<uint32_t> next;
-			if (block.predecessors.empty()) {
-				next = {block.id};
-			} else {
-				next = graph.blocks[block.predecessors.front()].dominators;
-				for (uint32_t i = 1; i < block.predecessors.size(); i++) {
-					next = IntersectSorted(next, graph.blocks[block.predecessors[i]].dominators);
-				}
-				AddUnique(next, block.id);
-				SortUnique(next);
+			order.push_back(id);
+			stack.pop_back();
+		}
+	};
+	visit(graph.entry_block);
+	for (uint32_t id = 0; id < count; id++) {
+		visit(id);
+	}
+	if (!post) {
+		std::reverse(order.begin(), order.end());
+	}
+
+	std::vector<uint64_t> next(words);
+	bool                  changed = true;
+	while (changed) {
+		changed = false;
+		for (const auto id: order) {
+			if (fixed[id]) {
+				continue;
 			}
-			if (next != block.dominators) {
-				block.dominators = std::move(next);
-				changed          = true;
+			const auto& sources = edges(graph.blocks[id]);
+			const auto* first   = &sets[sources.front() * words];
+			std::copy(first, first + words, next.begin());
+			for (size_t i = 1; i < sources.size(); i++) {
+				const auto* other = &sets[sources[i] * words];
+				for (size_t word = 0; word < words; word++) {
+					next[word] &= other[word];
+				}
+			}
+			next[id / 64u] |= uint64_t {1} << (id % 64u);
+			auto* set = &sets[id * words];
+			if (!std::equal(next.begin(), next.end(), set)) {
+				std::copy(next.begin(), next.end(), set);
+				changed = true;
 			}
 		}
 	}
-}
 
-void ComputePostDominators(Graph& graph) {
-	const auto count = static_cast<uint32_t>(graph.blocks.size());
-	const auto all   = AllBlockIds(count);
-
-	for (auto& block: graph.blocks) {
-		block.post_dominators = block.successors.empty() ? std::vector<uint32_t> {block.id} : all;
-	}
-
-	bool changed = true;
-	while (changed) {
-		changed = false;
-		for (auto& block: graph.blocks) {
-			std::vector<uint32_t> next;
-			if (block.successors.empty()) {
-				next = {block.id};
-			} else {
-				next = graph.blocks[block.successors.front()].post_dominators;
-				for (uint32_t i = 1; i < block.successors.size(); i++) {
-					next = IntersectSorted(next, graph.blocks[block.successors[i]].post_dominators);
-				}
-				AddUnique(next, block.id);
-				SortUnique(next);
-			}
-			if (next != block.post_dominators) {
-				block.post_dominators = std::move(next);
-				changed               = true;
+	for (uint32_t id = 0; id < count; id++) {
+		auto&       result = post ? graph.blocks[id].post_dominators : graph.blocks[id].dominators;
+		const auto* set    = &sets[id * words];
+		result.clear();
+		for (size_t word = 0; word < words; word++) {
+			for (auto bits = set[word]; bits != 0u; bits &= bits - 1u) {
+				result.push_back(static_cast<uint32_t>(word * 64u + std::countr_zero(bits)));
 			}
 		}
 	}
@@ -964,8 +992,8 @@ void ComputeComponents(Graph& graph) {
 }
 
 void RecomputeAnalyses(Graph& graph) {
-	ComputeDominators(graph);
-	ComputePostDominators(graph);
+	SolveDominance(graph, false);
+	SolveDominance(graph, true);
 	ComputeBackEdges(graph);
 	ComputeNaturalLoops(graph);
 	ComputeComponents(graph);

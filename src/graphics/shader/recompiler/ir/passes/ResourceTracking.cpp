@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <bit>
+#include <cstdlib> // PERFTMP
 #include <fmt/format.h>
 #include <optional>
 #include <span>
@@ -107,6 +108,7 @@ public:
 			Fail(0, "SRT plan is not ready");
 		}
 		PlanIndirectTables();
+		LowerRuntimeBufferLoads();
 		for (auto* block: m_program.blocks) {
 			for (auto& inst: *block) {
 				Collect(inst);
@@ -166,6 +168,10 @@ public:
 				                   return std::ranges::find(plan.reads, inst) != plan.reads.end();
 			                   });
 		});
+		if (m_info.uses_bindless) { // PERFTMP
+			std::fprintf(stderr, "PERFTMP bindless shader hash=0x%016llx\n",
+			             static_cast<unsigned long long>(m_program.shader_hash));
+		}
 		m_program.descriptor_sources         = std::move(m_sources);
 		m_program.info                       = std::move(m_info);
 		m_program.resource_tracking_complete = true;
@@ -202,6 +208,13 @@ private:
 		const auto message =
 		    fmt::format("shader resource tracking: hash=0x{:016x} stage={} pc=0x{:08x} {}",
 		                m_program.shader_hash, StageName(m_program.stage), pc, reason);
+		if (std::getenv("KYTY_DUMP_IR_ON_FAIL") != nullptr) { // PERFTMP
+			const auto dump = ProgramToString(m_program);
+			if (auto* file = std::fopen(std::getenv("KYTY_DUMP_IR_ON_FAIL"), "w")) {
+				std::fwrite(dump.data(), 1, dump.size(), file);
+				std::fclose(file);
+			}
+		}
 		EXIT("%s", message.c_str());
 		std::abort();
 	}
@@ -568,13 +581,70 @@ private:
 	}
 
 	// Every use of the first `width` table reads is a descriptor handle like `handle`.
-	static bool ReadsFeedOnlyHandles(const std::array<Inst*, 8>& reads, const Inst& handle,
-	                                 uint32_t width) {
-		return std::all_of(reads.begin(), reads.begin() + width, [&](const Inst* read) {
-			return !read->Uses().empty() && std::ranges::all_of(read->Uses(), [&](const Use& use) {
-				return use.user->GetOpcode() == handle.GetOpcode() && use.user->NumArgs() == width;
-			});
+	// `count` reads (fewer than the handle's dwords for an r128 T#) feed only handles like
+	// `handle`. A table entry's dwords may also be read as data (e.g. a shader computing a
+	// texture's size from T# dword 2 itself). Those uses keep a load of their own; see
+	// SplitDataUses.
+	static bool ReadsFeedHandlesOrData(const std::array<Inst*, 8>& reads, const Inst& handle,
+	                                   uint32_t count) {
+		return std::all_of(reads.begin(), reads.begin() + count, [&](const Inst* read) {
+			return std::ranges::any_of(
+			           read->Uses(),
+			           [&](const Use& use) { return IsTableHandleUse(use, handle); }) &&
+			       std::ranges::all_of(read->Uses(), [&](const Use& use) {
+				       return IsTableHandleUse(use, handle) ||
+				              !IsResourceHandle(use.user->GetOpcode());
+			       });
 		});
+	}
+
+	static bool IsResourceHandle(ValueOpcode opcode) {
+		return opcode == ValueOpcode::GetBufferResource ||
+		       opcode == ValueOpcode::GetImageResource ||
+		       opcode == ValueOpcode::GetSamplerResource ||
+		       opcode == ValueOpcode::GetAddressResource;
+	}
+
+	static bool IsTableHandleUse(const Use& use, const Inst& handle) {
+		return use.user->GetOpcode() == handle.GetOpcode() &&
+		       use.user->NumArgs() == handle.NumArgs();
+	}
+
+	// Planned table reads become planning-only memory; give their data users a separate load.
+	void SplitDataUses(const std::array<Inst*, 8>& reads, const Inst& handle, uint32_t count) {
+		for (uint32_t dword = 0; dword < count; dword++) {
+			auto*            read = reads[dword];
+			std::vector<Use> data_uses;
+			for (const auto& use: read->Uses()) {
+				if (!IsTableHandleUse(use, handle)) {
+					data_uses.push_back(use);
+				}
+			}
+			if (data_uses.empty()) {
+				continue;
+			}
+			auto*      block = read->Parent();
+			const auto where = std::ranges::find_if(
+			    block->Instructions(), [&](const Inst& inst) { return &inst == read; });
+			auto flags  = read->Flags<MemoryFlags>();
+			auto memory = m_program.memory_info[flags.index];
+			flags.index = static_cast<uint32_t>(m_program.memory_info.size());
+			m_program.memory_info.push_back(memory);
+			std::vector<Value> args;
+			for (size_t arg = 0; arg < read->NumArgs(); arg++) {
+				args.push_back(read->Arg(arg));
+			}
+			EXIT_IF(args.size() != 2u);
+			auto& copy = *block->PrependNewInst(where, read->GetOpcode(), {args[0], args[1]},
+			                                    std::bit_cast<uint64_t>(flags));
+			for (const auto& use: data_uses) {
+				use.user->SetArg(use.operand, Value(&copy));
+			}
+			if (std::ranges::find(m_program.dynamic_reads, Value(read)) !=
+			    m_program.dynamic_reads.end()) {
+				m_program.dynamic_reads.push_back(Value(&copy));
+			}
+		}
 	}
 
 	static bool UsesOnly(const Inst& value, std::span<const Inst* const> users) {
@@ -751,6 +821,35 @@ private:
 	// host-evaluable bound fails. The host then enumerates keys [0, bound), so the exact form
 	// of the comparison only matters for the bound it names; an inclusive or post-increment
 	// compare over-approximates by one entry, which the dense-prefix rule absorbs.
+	// A table index masked to an immediate width (e.g. the texture byte of a material record,
+	// `record & 0xff`): every entry the mask allows is a candidate, up to a heap table's size.
+	static bool MaskedKeyRange(Value key, uint32_t& count) {
+		const auto* inst = key.Resolve().TryInstruction();
+		if (inst == nullptr) {
+			return false;
+		}
+		uint32_t bits = 0;
+		if (inst->GetOpcode() == ValueOpcode::BitwiseAnd32 && inst->NumArgs() == 2u) {
+			uint32_t mask = 0;
+			if (!(ImmediateU32(inst->Arg(1), mask) || ImmediateU32(inst->Arg(0), mask)) ||
+			    mask == 0u || (mask & (mask + 1u)) != 0u) {
+				return false;
+			}
+			bits = static_cast<uint32_t>(std::popcount(mask));
+		} else if (inst->GetOpcode() == ValueOpcode::BitFieldUExtract && inst->NumArgs() == 3u) {
+			if (!ImmediateU32(inst->Arg(2), bits) || bits == 0u) {
+				return false;
+			}
+		} else {
+			return false;
+		}
+		if (bits >= 32u || (1u << bits) > MaxHeapTableKeys) {
+			return false;
+		}
+		count = 1u << bits;
+		return true;
+	}
+
 	bool LoopBoundedKey(Value key, uint32_t& count, Value& bound) {
 		key             = ResolveForwardingPhis(key);
 		const auto* phi = key.TryInstruction();
@@ -879,23 +978,30 @@ private:
 			offset = immediate;
 		}
 		const auto* multiply = value.TryInstruction();
-		if (multiply == nullptr || multiply->GetOpcode() != ValueOpcode::IMul32 ||
-		    multiply->NumArgs() != 2u) {
+		if (multiply == nullptr || multiply->NumArgs() != 2u) {
 			return false;
 		}
-		if (ImmediateU32(multiply->Arg(0), stride)) {
+		if (multiply->GetOpcode() == ValueOpcode::ShiftLeftLogical32) {
+			// A power-of-two record stride (e.g. walking a list of object indices).
+			uint32_t shift = 0;
+			if (!ImmediateU32(multiply->Arg(1), shift) || shift >= 32u) {
+				return false;
+			}
+			stride   = 1u << shift;
+			selector = multiply->Arg(0).Resolve();
+		} else if (multiply->GetOpcode() != ValueOpcode::IMul32) {
+			return false;
+		} else if (ImmediateU32(multiply->Arg(0), stride)) {
 			selector = multiply->Arg(1).Resolve();
 		} else if (ImmediateU32(multiply->Arg(1), stride)) {
 			selector = multiply->Arg(0).Resolve();
 		} else {
 			return false;
 		}
-		// The record index is wave-uniform: the first active lane's, or the lane a waterfall
-		// loop picked for this iteration.
-		const auto* selector_inst = selector.TryInstruction();
-		return stride != 0u && selector_inst != nullptr &&
-		       (selector_inst->GetOpcode() == ValueOpcode::ReadFirstLane ||
-		        selector_inst->GetOpcode() == ValueOpcode::ReadLane);
+		// The record offset of a scalar load is wave-uniform whatever produces the index (the
+		// first active lane's, a waterfall pick, or a loop counter); every record the material
+		// buffer holds is enumerated on the host.
+		return stride != 0u && selector.TryInstruction() != nullptr;
 	}
 
 	// Matches `handle` against a descriptor-table fetch: every dword is a scalar read of the same
@@ -1109,7 +1215,20 @@ private:
 		Inst*                heap_handle = nullptr;
 		Value                heap_offset;
 		uint32_t             table_offset = 0;
-		for (uint32_t dword = 0; dword < width; dword++) {
+		// An r128 T# has no upper half: its handle carries zeros there, and only the four real
+		// dwords come from the table.
+		uint32_t read_dwords = width;
+		if (width == 8u) {
+			bool zero_tail = true;
+			for (uint32_t dword = 4u; dword < width && zero_tail; dword++) {
+				uint32_t value = 1;
+				zero_tail      = ImmediateU32(handle.Arg(dword), value) && value == 0u;
+			}
+			if (zero_tail) {
+				read_dwords = 4u;
+			}
+		}
+		for (uint32_t dword = 0; dword < read_dwords; dword++) {
 			heap_reads[dword] = handle.Arg(dword).Resolve().TryInstruction();
 			if (heap_reads[dword] == nullptr) {
 				return false;
@@ -1140,6 +1259,9 @@ private:
 			}
 			plan.memory[dword] = memory_index;
 			plan.reads[dword]  = heap_reads[dword];
+		}
+		for (uint32_t dword = read_dwords; dword < width; dword++) {
+			plan.memory[dword] = plan.memory[0];
 		}
 
 		// Pointer hop: the descriptors are S_LOADed at fixed offsets through an address that the
@@ -1225,7 +1347,8 @@ private:
 		uint32_t key_count = 0;
 		Value    key_bound;
 		bool     bounded      = BoundedKeyRange(Value(material_read), key_count) ||
-		                        LoopBoundedKey(Value(material_read), key_count, key_bound);
+		                        LoopBoundedKey(Value(material_read), key_count, key_bound) ||
+		                        MaskedKeyRange(Value(material_read), key_count);
 		bool     heap_bounded = false;
 		if (!bounded && heap_handle->GetOpcode() == ValueOpcode::GetBufferResource) {
 			// Neither a small computed range nor a material-record read (that form is matched
@@ -1273,7 +1396,7 @@ private:
 			}
 			// One fetched entry may feed several accesses (e.g. a loop body sampling the
 			// selected texture more than once); each handle becomes a plan over the same table.
-			if (!ReadsFeedOnlyHandles(heap_reads, handle, width)) {
+			if (!ReadsFeedHandlesOrData(heap_reads, handle, read_dwords)) {
 				return false;
 			}
 			DescriptorSource heap_source;
@@ -1300,6 +1423,7 @@ private:
 			    .pointer_offset  = pointer_offset,
 			    .sampler         = handle.GetOpcode() == ValueOpcode::GetSamplerResource,
 			};
+			SplitDataUses(heap_reads, handle, read_dwords);
 			plan.handle = &handle;
 			plan.width  = width;
 			plan.source = InternSource(table_source);
@@ -1307,10 +1431,11 @@ private:
 			plan.roots  = table_source.dwords;
 			return true;
 		}
-		if (offset_root != shift || entry_stride != (width * sizeof(uint32_t)) || via_pointer ||
-		    handle.GetOpcode() == ValueOpcode::GetSamplerResource) {
-			// Material-record keys index a packed heap directly; a folded immediate or a wider
-			// record belongs to the bounded forms only.
+		if (offset_root != shift || entry_stride < (width * sizeof(uint32_t)) || via_pointer) {
+			// Material-record keys index the heap directly: a packed descriptor array or a table
+			// of larger records holding the descriptor at a fixed offset (Ghost of Yotei's
+			// per-object records, which hold an S# as well). A folded immediate belongs to the
+			// bounded forms only.
 			return false;
 		}
 		uint32_t    material_memory_index = 0;
@@ -1337,13 +1462,21 @@ private:
 		}
 
 		// The key stays a runtime load, so the shader may also test it (e.g. against a null
-		// index); only the scaled offset must be ours.
-		if (!UsesOnly(*shift, heap_users)) {
+		// index); the scaled offset may only address this table or further scalar fields of the
+		// same record.
+		const auto record_offset_is_ours = [&](const Inst& value) {
+			return !value.Uses().empty() && std::ranges::all_of(value.Uses(), [&](const Use& use) {
+				uint32_t memory_index = 0;
+				return std::ranges::find(heap_users, use.user) != heap_users.end() ||
+				       (use.operand == 1u && ScalarReadMemory(*use.user, memory_index) != nullptr);
+			});
+		};
+		if (!record_offset_is_ours(*shift)) {
 			return false;
 		}
 		// One fetched entry may feed several accesses; each handle becomes a plan over the
 		// same table.
-		if (!ReadsFeedOnlyHandles(heap_reads, handle, width)) {
+		if (!ReadsFeedHandlesOrData(heap_reads, handle, read_dwords)) {
 			return false;
 		}
 
@@ -1373,8 +1506,10 @@ private:
 		    .heap_offset     = table_offset,
 		    .entry_dwords    = width,
 		    .entry_stride    = entry_stride,
+		    .sampler         = handle.GetOpcode() == ValueOpcode::GetSamplerResource,
 		};
 
+		SplitDataUses(heap_reads, handle, read_dwords);
 		plan.handle = &handle;
 		plan.width  = width;
 		plan.source = InternSource(table_source);
@@ -1439,6 +1574,245 @@ private:
 		}
 	}
 
+	// A V# whose base address only the GPU has (e.g. a ray-tracing pass reading the acceleration
+	// structure it picked from LDS) cannot be bound by the host. Raw 32-bit loads through one
+	// become device-address loads of base + index * stride + offset, zero past NumRecords.
+	void LowerRuntimeBufferLoads() {
+		for (auto* block: m_program.blocks) {
+			std::vector<Inst*> loads;
+			for (auto& inst: *block) {
+				const auto op = inst.GetOpcode();
+				if (op == ValueOpcode::LoadBufferU32 || op == ValueOpcode::LoadBufferU32x2 ||
+				    op == ValueOpcode::LoadBufferU32x3 || op == ValueOpcode::LoadBufferU32x4 ||
+				    (op == ValueOpcode::ReadConstBuffer && inst.NumArgs() == 2u)) {
+					loads.push_back(&inst);
+				}
+			}
+			for (auto* load: loads) {
+				if (load->GetOpcode() == ValueOpcode::ReadConstBuffer) {
+					LowerRuntimeConstBufferRead(*block, *load);
+				} else {
+					LowerRuntimeBufferLoad(*block, *load);
+				}
+			}
+		}
+	}
+
+	[[nodiscard]] bool HasRuntimeDescriptor(const Inst& handle) {
+		if (handle.GetOpcode() != ValueOpcode::GetBufferResource || handle.NumArgs() != 4u ||
+		    FindIndirectTable(handle) != nullptr) {
+			return false;
+		}
+		DescriptorSource descriptor;
+		descriptor.dword_count = 4u;
+		for (uint32_t dword = 0; dword < 4u; dword++) {
+			descriptor.dwords[dword] = LowerDescriptorPhi(handle.Arg(dword));
+		}
+		// Only a GPU-computed address is lowered; other unevaluable fields stay an error.
+		uint32_t bad_dword = 0;
+		return !ValidateSource(descriptor, bad_dword) && bad_dword < 2u;
+	}
+
+	// S_BUFFER_LOAD through a V# only the GPU has: a scalar device-address load, zero past the
+	// buffer's end like the host evaluator's constant-buffer reads.
+	void LowerRuntimeConstBufferRead(Block& block, Inst& read) {
+		const auto flags  = read.Flags<MemoryFlags>();
+		auto*      handle = read.Arg(0).Resolve().TryInstruction();
+		if (flags.index >= m_program.memory_info.size() || handle == nullptr ||
+		    !HasRuntimeDescriptor(*handle)) {
+			return;
+		}
+		const auto memory = m_program.memory_info[flags.index];
+		const auto where  = std::ranges::find_if(block.Instructions(),
+		                                         [&](const Inst& inst) { return &inst == &read; });
+		const auto emit   = [&](ValueOpcode op, std::initializer_list<Value> args,
+		                        uint64_t inst_flags = 0) {
+			return Value(&*block.PrependNewInst(where, op, args, inst_flags));
+		};
+		const auto dword1  = handle->Arg(1);
+		const auto records = handle->Arg(2);
+		const auto offset  = read.Arg(1);
+		const auto stride =
+		    emit(ValueOpcode::BitwiseAnd32,
+		         {emit(ValueOpcode::ShiftRightLogical32, {dword1, Value(16u)}), Value(0x3fffu)});
+		const auto size =
+		    emit(ValueOpcode::SelectU32, {emit(ValueOpcode::IEqual32, {stride, Value(0u)}), records,
+		                                  emit(ValueOpcode::IMul32, {stride, records})});
+		const auto aligned =
+		    emit(ValueOpcode::BitwiseAnd32,
+		         {emit(ValueOpcode::IAdd32, {offset, Value(memory.offset)}), Value(~uint32_t {3})});
+		const auto in_bounds = emit(ValueOpcode::ULessThanEqual32,
+		                            {emit(ValueOpcode::IAdd32, {aligned, Value(4u)}), size});
+		const auto address =
+		    emit(ValueOpcode::GetAddressResource,
+		         {handle->Arg(0), emit(ValueOpcode::BitwiseAnd32, {dword1, Value(0xffffu)})});
+		auto word            = memory;
+		word.kind            = ResourceKind::ScalarAddress;
+		word.address_is_full = false;
+		word.resource        = 0;
+		word.sampler         = 0;
+		const MemoryFlags word_flags {.index = static_cast<uint32_t>(m_program.memory_info.size()),
+		                              .pc    = flags.pc};
+		m_program.memory_info.push_back(word);
+		const auto loaded =
+		    emit(ValueOpcode::LoadAddressU32, {address, offset, Value(0u), in_bounds},
+		         std::bit_cast<uint64_t>(word_flags));
+		std::erase_if(m_program.dynamic_reads,
+		              [&](Value value) { return value.Resolve().TryInstruction() == &read; });
+		read.ReplaceUsesWith(loaded);
+	}
+
+	void LowerRuntimeBufferLoad(Block& block, Inst& load) {
+		const auto flags = load.Flags<MemoryFlags>();
+		if (flags.index >= m_program.memory_info.size() || load.NumArgs() != 5u) {
+			return;
+		}
+		const auto memory = m_program.memory_info[flags.index];
+		auto*      handle = load.Arg(0).Resolve().TryInstruction();
+		if (memory.formatted || memory.typed || memory.data_bits != 32u || handle == nullptr ||
+		    !HasRuntimeDescriptor(*handle)) {
+			return;
+		}
+
+		const auto where = std::ranges::find_if(block.Instructions(),
+		                                        [&](const Inst& inst) { return &inst == &load; });
+		const auto emit  = [&](ValueOpcode op, std::initializer_list<Value> args,
+		                       uint64_t inst_flags = 0) {
+			return Value(&*block.PrependNewInst(where, op, args, inst_flags));
+		};
+		const auto dword0  = handle->Arg(0);
+		const auto dword1  = handle->Arg(1);
+		const auto records = handle->Arg(2);
+		const auto index   = load.Arg(1);
+		const auto active  = load.Arg(4);
+		const auto count   = BufferComponentCount(load.GetOpcode());
+
+		const auto base_high = emit(ValueOpcode::BitwiseAnd32, {dword1, Value(0xffffu)});
+		const auto stride =
+		    emit(ValueOpcode::BitwiseAnd32,
+		         {emit(ValueOpcode::ShiftRightLogical32, {dword1, Value(16u)}), Value(0x3fffu)});
+		const auto byte = emit(
+		    ValueOpcode::IAdd32,
+		    {emit(ValueOpcode::IAdd32, {emit(ValueOpcode::IMul32, {index, stride}), load.Arg(2)}),
+		     load.Arg(3)});
+		// Raw buffers bound bytes; structured ones bound the record index.
+		const auto raw_in =
+		    emit(ValueOpcode::ULessThanEqual32,
+		         {emit(ValueOpcode::IAdd32, {byte, Value(memory.offset + count * 4u)}), records});
+		const auto index_in   = emit(ValueOpcode::ULessThan32, {index, records});
+		const auto stride_raw = emit(ValueOpcode::IEqual32, {stride, Value(0u)});
+		const auto enabled =
+		    emit(ValueOpcode::LogicalAnd,
+		         {active, emit(ValueOpcode::SelectU1, {stride_raw, raw_in, index_in})});
+		const auto address = emit(ValueOpcode::GetAddressResource, {dword0, base_high});
+
+		std::array<Value, 4> words {};
+		for (uint32_t component = 0; component < count; component++) {
+			auto word            = memory;
+			word.kind            = ResourceKind::Global;
+			word.address_is_full = false;
+			word.offset          = memory.offset + component * 4u;
+			word.data_dwords     = 1u;
+			word.component_count = count;
+			word.component_index = component;
+			word.resource        = 0;
+			word.sampler         = 0;
+			word.idxen           = false;
+			word.offen           = false;
+			const MemoryFlags word_flags {
+			    .index = static_cast<uint32_t>(m_program.memory_info.size()), .pc = flags.pc};
+			m_program.memory_info.push_back(word);
+			words[component] =
+			    emit(ValueOpcode::LoadAddressU32, {address, byte, Value(0u), enabled},
+			         std::bit_cast<uint64_t>(word_flags));
+		}
+		static constexpr std::array Constructs {ValueOpcode::CompositeConstructU32x2,
+		                                        ValueOpcode::CompositeConstructU32x3,
+		                                        ValueOpcode::CompositeConstructU32x4};
+		Value                       result = words[0];
+		if (count == 2u) {
+			result = emit(Constructs[0], {words[0], words[1]});
+		} else if (count == 3u) {
+			result = emit(Constructs[1], {words[0], words[1], words[2]});
+		} else if (count == 4u) {
+			result = emit(Constructs[2], {words[0], words[1], words[2], words[3]});
+		}
+		load.ReplaceUsesWith(result);
+	}
+
+	// A descriptor the host can evaluate once per draw (the normal binding path).
+	bool HostEvaluable(const Inst* handle, uint32_t width, bool sampler, bool sample_adjust) {
+		if (handle == nullptr || handle->NumArgs() != width) {
+			return false;
+		}
+		DescriptorSource descriptor;
+		MakeSource(*handle, width, sampler, sample_adjust, descriptor, 0u);
+		if (!sampler) {
+			for (uint32_t dword = 0; dword < descriptor.dword_count; dword++) {
+				const auto* value = descriptor.dwords[dword].Resolve().TryInstruction();
+				if (value != nullptr && value->GetOpcode() == ValueOpcode::ReadConstBuffer &&
+				    (value->NumArgs() < 2u || DependsOnWave(value->Arg(1)))) {
+					return false;
+				}
+			}
+		}
+		uint32_t bad_dword = 0;
+		return ValidateSource(descriptor, bad_dword);
+	}
+
+	// A sampled T# only the GPU knows (fetched through a per-lane pointer, a waterfall over
+	// per-lane keys, ...) is resolved through the bindless heap. Its dwords stay shader values.
+	bool CanBindlessImage(const Inst* handle, const MemoryInfo& memory, ValueOpcode op) {
+		const auto info = ImageOpcodeInfoOf(op);
+		if (handle == nullptr || handle->GetOpcode() != ValueOpcode::GetImageResource ||
+		    handle->NumArgs() != 8u || info.resource_class != ImageResourceClass::Sampled ||
+		    info.access != ImageAccess::Read ||
+		    (memory.image_sample_flags & Decoder::ImageSampleFlagCompare) != 0 ||
+		    !Bindless::ImageKind(memory.image_dimension).has_value()) {
+			return false;
+		}
+		for (uint32_t dword = 0; dword < 8u; dword++) {
+			if (handle->Arg(dword).Resolve().GetType() != Type::U32) {
+				return false;
+			}
+		}
+		return !HostEvaluable(handle, 8u, false, false);
+	}
+
+	uint32_t BindlessSource(uint32_t width) {
+		DescriptorSource descriptor;
+		descriptor.dword_count = width;
+		descriptor.dwords.fill(Value(0u));
+		return InternSource(descriptor);
+	}
+
+	// Whether a value may differ between waves of one draw: lane reads and stage inputs.
+	static bool DependsOnWave(Value value) {
+		std::vector<const Inst*>        pending;
+		std::unordered_set<const Inst*> visited;
+		if (const auto* root = value.Resolve().TryInstruction(); root != nullptr) {
+			pending.push_back(root);
+		}
+		while (!pending.empty()) {
+			const auto* inst = pending.back();
+			pending.pop_back();
+			if (!visited.insert(inst).second) {
+				continue;
+			}
+			const auto op = inst->GetOpcode();
+			if (op == ValueOpcode::ReadFirstLane || op == ValueOpcode::ReadLane ||
+			    op == ValueOpcode::GetBuiltin) {
+				return true;
+			}
+			for (size_t arg = 0; arg < inst->NumArgs(); arg++) {
+				if (const auto* operand = inst->Arg(arg).Resolve().TryInstruction()) {
+					pending.push_back(operand);
+				}
+			}
+		}
+		return false;
+	}
+
 	void GetHandle(Value value, ValueOpcode expected, uint32_t width, uint32_t pc, Inst*& handle,
 	               uint32_t& source, bool sampler = false, bool sample_adjust = false) {
 		handle = value.Resolve().TryInstruction();
@@ -1449,9 +1823,13 @@ private:
 		MakeSource(*handle, width, sampler, sample_adjust, descriptor, pc);
 		uint32_t bad_dword = 0;
 		if (expected == ValueOpcode::GetImageResource) {
+			// A T# loaded from a constant buffer at a draw-uniform offset (e.g. a material
+			// constant indexed by an SRT value) is one descriptor per draw. At an offset picked
+			// per wave it is a bindless table the host cannot reduce to one descriptor.
 			for (; bad_dword < descriptor.dword_count; bad_dword++) {
 				const auto* value = descriptor.dwords[bad_dword].Resolve().TryInstruction();
-				if (value != nullptr && value->GetOpcode() == ValueOpcode::ReadConstBuffer) {
+				if (value != nullptr && value->GetOpcode() == ValueOpcode::ReadConstBuffer &&
+				    (value->NumArgs() < 2u || DependsOnWave(value->Arg(1)))) {
 					Fail(pc, fmt::format("{} dword {} is not a valid runtime value",
 					                     ValueOpcodeName(expected), bad_dword));
 				}
@@ -1531,7 +1909,8 @@ private:
 		                           memory.kind == ResourceKind::ScalarBuffer;
 	}
 
-	uint32_t AddImage(uint32_t source, const MemoryInfo& memory, ValueOpcode op, uint32_t pc) {
+	uint32_t AddImage(uint32_t source, const MemoryInfo& memory, ValueOpcode op, uint32_t pc,
+	                  bool bindless = false) {
 		const auto resource_class = ImageOpcodeInfoOf(op).resource_class;
 		const auto mip   = resource_class == ImageResourceClass::Storage && memory.image_has_mip
 		                       ? ImageMipMode::DynamicStorage
@@ -1541,7 +1920,8 @@ private:
 			auto& image = m_info.images[i];
 			if (image.source == source && image.resource_class == resource_class &&
 			    image.dimension == memory.image_dimension && image.mip_mode == mip &&
-			    image.depth_compare == depth && image.r128 == memory.image_r128) {
+			    image.depth_compare == depth && image.r128 == memory.image_r128 &&
+			    image.bindless == bindless) {
 				Merge(image, op, pc);
 				return i;
 			}
@@ -1557,6 +1937,12 @@ private:
 		image.mip_mode       = mip;
 		image.depth_compare  = depth;
 		image.r128           = memory.image_r128;
+		image.bindless       = bindless;
+		if (bindless) {
+			// Only float sampling is emitted through the heap; the T# picks the texture itself.
+			image.numeric_class = Prospero::TextureNumericClass::Float;
+		}
+		m_info.uses_bindless |= bindless;
 		Merge(image, op, pc);
 		m_info.images.push_back(image);
 		return static_cast<uint32_t>(m_info.images.size() - 1);
@@ -1572,9 +1958,9 @@ private:
 		image.atomic       = image.atomic || atomic;
 	}
 
-	uint32_t AddSampler(uint32_t source, uint32_t pc) {
+	uint32_t AddSampler(uint32_t source, uint32_t pc, bool bindless = false) {
 		for (uint32_t i = 0; i < m_info.samplers.size(); i++) {
-			if (m_info.samplers[i].source == source) {
+			if (m_info.samplers[i].source == source && m_info.samplers[i].bindless == bindless) {
 				m_info.samplers[i].first_use_pc = std::min(m_info.samplers[i].first_use_pc, pc);
 				return i;
 			}
@@ -1582,7 +1968,8 @@ private:
 		if (m_info.samplers.size() >= ShaderInfo::MaxSamplers) {
 			return UINT32_MAX;
 		}
-		m_info.samplers.push_back({source, pc});
+		m_info.samplers.push_back({.source = source, .first_use_pc = pc, .bindless = bindless});
+		m_info.uses_bindless |= bindless;
 		return static_cast<uint32_t>(m_info.samplers.size() - 1);
 	}
 
@@ -1699,12 +2086,16 @@ private:
 		}
 		handle               = inst.Arg(0).Resolve().TryInstruction();
 		const auto* indirect = handle != nullptr ? FindIndirectTable(*handle) : nullptr;
+		bool        bindless = false;
 		if (indirect != nullptr) {
 			source = indirect->source;
+		} else if (CanBindlessImage(handle, memory, op)) {
+			source   = BindlessSource(8u);
+			bindless = true;
 		} else {
 			GetHandle(inst.Arg(0), ValueOpcode::GetImageResource, 8, flags.pc, handle, source);
 		}
-		resource = AddImage(source, memory, op, flags.pc);
+		resource = AddImage(source, memory, op, flags.pc, bindless);
 		if (resource == UINT32_MAX) {
 			Fail(flags.pc, "image resource limit exceeded");
 		}
@@ -1721,13 +2112,17 @@ private:
 			sampler_handle = inst.Arg(1).Resolve().TryInstruction();
 			const auto* sampler_table =
 			    sampler_handle != nullptr ? FindIndirectTable(*sampler_handle) : nullptr;
+			bool sampler_bindless = false;
 			if (sampler_table != nullptr) {
 				sampler_source = sampler_table->source;
+			} else if (bindless && !HostEvaluable(sampler_handle, 4u, true, sample_adjust)) {
+				sampler_source   = BindlessSource(4u);
+				sampler_bindless = true;
 			} else {
 				GetHandle(inst.Arg(1), ValueOpcode::GetSamplerResource, 4, flags.pc, sampler_handle,
 				          sampler_source, true, sample_adjust);
 			}
-			sampler = AddSampler(sampler_source, flags.pc);
+			sampler = AddSampler(sampler_source, flags.pc, sampler_bindless);
 			if (sampler == UINT32_MAX) {
 				Fail(flags.pc, "sampler resource limit exceeded");
 			}

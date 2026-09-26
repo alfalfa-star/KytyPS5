@@ -171,7 +171,48 @@ uint32_t F32ArrayType(EmitterState& state, uint32_t count) {
 	return state.builder.Type(spv::OpTypeArray, TypeF32(state), ConstantU32(state, count));
 }
 
+void DefineBindless(EmitterState& state) {
+	namespace Bindless = IR::Bindless;
+	state.builder.RequireCapability(spv::CapabilityRuntimeDescriptorArray);
+	state.builder.RequireCapability(spv::CapabilitySampledImageArrayNonUniformIndexing);
+	state.builder.RequireCapability(spv::CapabilityShaderNonUniform);
+	const auto Define = [&](uint32_t type, const char* name, spv::StorageClass storage,
+	                        uint32_t binding) {
+		const auto variable =
+		    state.builder.DefineGlobalVariable(TypePointer(state, storage, type), storage);
+		state.builder.AddName(variable, name);
+		state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationDescriptorSet,
+		                            Bindless::Set);
+		state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationBinding, binding);
+		return variable;
+	};
+	constexpr std::array<std::pair<ImageDimension, uint32_t>, 3> Arrays {{
+	    {ImageDimension::Dim2D, Bindless::Images2D},
+	    {ImageDimension::Dim2DArray, Bindless::Images2DArray},
+	    {ImageDimension::Dim3D, Bindless::Images3D},
+	}};
+	for (const auto& [dimension, binding]: Arrays) {
+		IR::ImageResource image;
+		image.resource_class = IR::ImageResourceClass::Sampled;
+		image.numeric_class  = Prospero::TextureNumericClass::Float;
+		image.dimension      = dimension;
+		state.bindless_image_variables[BindlessImageArrayIndex(dimension)] =
+		    Define(state.builder.Type(spv::OpTypeRuntimeArray, ImageType(state, image)),
+		           "bindless_images", spv::StorageClassUniformConstant, binding);
+	}
+	state.bindless_sampler_variable =
+	    Define(state.builder.Type(spv::OpTypeRuntimeArray, state.builder.Type(spv::OpTypeSampler)),
+	           "bindless_samplers", spv::StorageClassUniformConstant, Bindless::Samplers);
+	state.bindless_table_variable    = Define(StorageBufferType(state), "bindless_table",
+	                                          spv::StorageClassStorageBuffer, Bindless::Table);
+	state.bindless_feedback_variable = Define(StorageBufferType(state), "bindless_feedback",
+	                                          spv::StorageClassStorageBuffer, Bindless::Feedback);
+}
+
 void DefineDescriptors(EmitterState& state) {
+	if (state.program.info.uses_bindless) {
+		DefineBindless(state);
+	}
 	if (state.program.bindings.UsesPushData() || state.program.stage == ShaderType::Mesh) {
 		const auto type              = PushConstantBlockType(state);
 		state.push_constant_variable = state.builder.DefineGlobalVariable(

@@ -6,6 +6,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdio> // PERFTMP
 #include <cstring>
 #include <mutex>
 #include <unordered_set>
@@ -298,8 +299,18 @@ static int32_t ValidateDecoderConfig(const Videodec2DecoderConfigInfo* config,
 	return OK;
 }
 
+// One NV12 picture as the decoder writes it: 256-byte aligned pitch, chroma rows after luma.
+// Unspecified (-1) dimensions default to 1080p. Games carve several frame buffers of this size
+// from a fixed pool and give up on the decoder when fewer than they need fit.
+static size_t MaxFrameBufferSize(const Videodec2DecoderConfigInfo* config) {
+	const uint64_t width  = config->max_frame_width > 0 ? config->max_frame_width : 1920;
+	const uint64_t height = config->max_frame_height > 0 ? config->max_frame_height : 1088;
+	const uint64_t pitch  = (width + 255u) & ~uint64_t {255u};
+	return pitch * height + pitch * ((height + 1u) / 2u);
+}
+
 static int32_t KYTY_SYSV_ABI
-QueryComputeMemoryInfo(Videodec2ComputeMemoryInfo* compute_memory_info) {
+QueryComputeMemoryInfoImpl(Videodec2ComputeMemoryInfo* compute_memory_info) {
 	PRINT_NAME();
 
 	if (compute_memory_info == nullptr) {
@@ -316,7 +327,7 @@ QueryComputeMemoryInfo(Videodec2ComputeMemoryInfo* compute_memory_info) {
 	return OK;
 }
 
-static int32_t KYTY_SYSV_ABI AllocateComputeQueue(
+static int32_t KYTY_SYSV_ABI AllocateComputeQueueImpl(
     const Videodec2ComputeConfigInfo* compute_config_info,
     const Videodec2ComputeMemoryInfo* compute_memory_info, Videodec2ComputeQueue* compute_queue) {
 	PRINT_NAME();
@@ -361,8 +372,8 @@ static int32_t KYTY_SYSV_ABI ReleaseComputeQueue(Videodec2ComputeQueue compute_q
 	return compute_queue != nullptr ? OK : VIDEODEC2_ERROR_COMPUTE_QUEUE_ID;
 }
 
-static int32_t KYTY_SYSV_ABI QueryDecoderMemoryInfo(const Videodec2DecoderConfigInfo* config,
-                                                    Videodec2DecoderMemoryInfo*       memory_info) {
+static int32_t KYTY_SYSV_ABI QueryDecoderMemoryInfoImpl(const Videodec2DecoderConfigInfo* config,
+                                                        Videodec2DecoderMemoryInfo* memory_info) {
 	PRINT_NAME();
 
 	if (config == nullptr || memory_info == nullptr) {
@@ -385,16 +396,16 @@ static int32_t KYTY_SYSV_ABI QueryDecoderMemoryInfo(const Videodec2DecoderConfig
 	memory_info->gpu_memory             = nullptr;
 	memory_info->cpu_gpu_memory_size    = VIDEODEC2_MIN_MEMORY_SIZE;
 	memory_info->cpu_gpu_memory         = nullptr;
-	memory_info->max_frame_buffer_size  = VIDEODEC2_MIN_MEMORY_SIZE;
+	memory_info->max_frame_buffer_size  = MaxFrameBufferSize(config);
 	memory_info->frame_buffer_alignment = 0x100;
 	memory_info->reserved0              = 0;
 
 	return OK;
 }
 
-static int32_t KYTY_SYSV_ABI CreateDecoder(const Videodec2DecoderConfigInfo* config,
-                                           const Videodec2DecoderMemoryInfo* memory_info,
-                                           Videodec2Decoder*                 decoder) {
+static int32_t KYTY_SYSV_ABI CreateDecoderImpl(const Videodec2DecoderConfigInfo* config,
+                                               const Videodec2DecoderMemoryInfo* memory_info,
+                                               Videodec2Decoder*                 decoder) {
 	PRINT_NAME();
 
 	if (config == nullptr || memory_info == nullptr || decoder == nullptr) {
@@ -414,7 +425,7 @@ static int32_t KYTY_SYSV_ABI CreateDecoder(const Videodec2DecoderConfigInfo* con
 	if (memory_info->cpu_memory_size < VIDEODEC2_MIN_MEMORY_SIZE ||
 	    memory_info->gpu_memory_size < VIDEODEC2_MIN_MEMORY_SIZE ||
 	    memory_info->cpu_gpu_memory_size < VIDEODEC2_MIN_MEMORY_SIZE ||
-	    memory_info->max_frame_buffer_size < VIDEODEC2_MIN_MEMORY_SIZE) {
+	    memory_info->max_frame_buffer_size < MaxFrameBufferSize(config)) {
 		return VIDEODEC2_ERROR_MEMORY_SIZE;
 	}
 
@@ -457,9 +468,10 @@ static int32_t KYTY_SYSV_ABI DeleteDecoder(Videodec2Decoder decoder) {
 	return OK;
 }
 
-static int32_t KYTY_SYSV_ABI Decode(Videodec2Decoder decoder, const Videodec2InputData* input_data,
-                                    Videodec2FrameBuffer* frame_buffer,
-                                    Videodec2OutputInfo*  output_info) {
+static int32_t KYTY_SYSV_ABI DecodeImpl(Videodec2Decoder          decoder,
+                                        const Videodec2InputData* input_data,
+                                        Videodec2FrameBuffer*     frame_buffer,
+                                        Videodec2OutputInfo*      output_info) {
 	PRINT_NAME();
 
 	auto* state = GetDecoder(decoder);
@@ -542,7 +554,7 @@ static int32_t KYTY_SYSV_ABI Flush(Videodec2Decoder decoder, Videodec2FrameBuffe
 	return MapDecoderResult(result);
 }
 
-static int32_t KYTY_SYSV_ABI Reset(Videodec2Decoder decoder) {
+static int32_t KYTY_SYSV_ABI ResetImpl(Videodec2Decoder decoder) {
 	PRINT_NAME();
 
 	auto* state = GetDecoder(decoder);
@@ -650,6 +662,52 @@ static int32_t KYTY_SYSV_ABI GetPictureInfo(const Videodec2OutputInfo* output_in
 	return OK;
 }
 
+// PERFTMP: log results of the decoder setup calls.
+static int32_t KYTY_SYSV_ABI Decode(Videodec2Decoder d, const Videodec2InputData* in,
+                                    Videodec2FrameBuffer* fb, Videodec2OutputInfo* out) {
+	const auto r      = DecodeImpl(d, in, fb, out);
+	static int logged = 0;
+	if (logged++ < 20) {
+		std::fprintf(stderr, "PERFTMP vdec2 Decode=%x\n", r);
+	}
+	return r;
+}
+static int32_t KYTY_SYSV_ABI QueryComputeMemoryInfo(Videodec2ComputeMemoryInfo* info) {
+	const auto r = QueryComputeMemoryInfoImpl(info);
+	std::fprintf(stderr, "PERFTMP vdec2 QueryComputeMemoryInfo=%x size=%zu\n", r,
+	             info ? info->this_size : 0);
+	return r;
+}
+static int32_t KYTY_SYSV_ABI AllocateComputeQueue(const Videodec2ComputeConfigInfo* c,
+                                                  const Videodec2ComputeMemoryInfo* m,
+                                                  Videodec2ComputeQueue*            q) {
+	const auto r = AllocateComputeQueueImpl(c, m, q);
+	std::fprintf(stderr, "PERFTMP vdec2 AllocateComputeQueue=%x\n", r);
+	return r;
+}
+static int32_t KYTY_SYSV_ABI QueryDecoderMemoryInfo(const Videodec2DecoderConfigInfo* c,
+                                                    Videodec2DecoderMemoryInfo*       m) {
+	const auto r = QueryDecoderMemoryInfoImpl(c, m);
+	std::fprintf(stderr,
+	             "PERFTMP vdec2 QueryDecoderMemoryInfo=%x size=%zu/%zu codec=%u res=%u %dx%d "
+	             "dpb=%d depth=%u\n",
+	             r, c ? c->this_size : 0, sizeof(Videodec2DecoderConfigInfo), c ? c->codec_type : 0,
+	             c ? c->resource_type : 0, c ? c->max_frame_width : 0, c ? c->max_frame_height : 0,
+	             c ? c->max_dpb_frame_count : 0, c ? c->decode_input_queue_depth : 0);
+	return r;
+}
+static int32_t KYTY_SYSV_ABI CreateDecoder(const Videodec2DecoderConfigInfo* c,
+                                           const Videodec2DecoderMemoryInfo* m,
+                                           Videodec2Decoder*                 d) {
+	const auto r = CreateDecoderImpl(c, m, d);
+	std::fprintf(stderr, "PERFTMP vdec2 CreateDecoder=%x\n", r);
+	return r;
+}
+static int32_t KYTY_SYSV_ABI Reset(Videodec2Decoder d) {
+	const auto r = ResetImpl(d);
+	std::fprintf(stderr, "PERFTMP vdec2 Reset=%x\n", r);
+	return r;
+}
 LIB_DEFINE(InitVideoDec2_1) {
 	PRINT_NAME_ENABLE(true);
 

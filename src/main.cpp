@@ -48,7 +48,8 @@ static void PrintUsage() {
 	    "  --user-name <name>                   Local user name (1-16 bytes). Default: Kyty.\n");
 	::printf("  --user-id <num>                      Local user ID. Default: %d.\n",
 	         Config::DEFAULT_USER_ID);
-	::printf("  --mic <name>                        Capture from this microphone; omit for silence.\n");
+	::printf(
+	    "  --mic <name>                        Capture from this microphone; omit for silence.\n");
 	::printf(
 	    "  --present-mode <value>               Fifo, Mailbox, or Immediate. Default: Mailbox.\n");
 	::printf(
@@ -341,7 +342,9 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 	return show_help || (!options.app0_dir.empty() && !options.elf.empty());
 }
 
+#include <sys/prctl.h> // PERFTMP
 int main(int argc, char* argv[]) {
+	prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY, 0, 0, 0); // PERFTMP
 	VirtualMemory::Init();
 	InitializeThreads();
 

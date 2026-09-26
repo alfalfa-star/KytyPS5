@@ -3,6 +3,7 @@
 #include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/logging/log.h"
+#include "common/perfTmp.h" // PERFTMP
 #include "common/profiler.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
@@ -125,6 +126,26 @@ bool ResolveComputeBufferFill(const ShaderComputeInputInfo& input, uint32_t grou
 	return true;
 }
 
+// A compute fill of DCC metadata (a fast clear) runs as a buffer fill: while the metadata is
+// not GPU-owned that is a CPU write, so binding the surface later decodes the clear without
+// waiting for the GPU to finish the dispatch.
+bool RenderExecutor::TryConsumeComputeMetadataFill(const ShaderComputeInputInfo& input,
+                                                   CommandBuffer& command, uint32_t group_x,
+                                                   uint32_t group_y, uint32_t group_z,
+                                                   uint32_t mode) {
+	ShaderBufferResource descriptor;
+	uint32_t             packed_fill = 0;
+	uint64_t             size        = 0;
+	if (!ResolveComputeBufferFill(input, group_x, group_y, group_z, mode, descriptor, packed_fill,
+	                              size) ||
+	    (descriptor.Base48() & 3u) != 0u || (size & 3u) != 0u ||
+	    !command.GetContext().GetTextureCache().IsDccMetadataOnly(descriptor.Base48(), size)) {
+		return false;
+	}
+	command.GetContext().GetBufferCache().FillBuffer(descriptor.Base48(), size, packed_fill, false);
+	return true;
+}
+
 bool RenderExecutor::TryConsumeComputeImageClear(const ShaderComputeInputInfo& input,
                                                  CommandBuffer& command, uint32_t group_x,
                                                  uint32_t group_y, uint32_t group_z,
@@ -201,6 +222,20 @@ bool RenderExecutor::TryConsumeComputeImageClear(const ShaderComputeInputInfo& i
 void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
                                     uint32_t thread_group_x, uint32_t thread_group_y,
                                     uint32_t thread_group_z, uint32_t mode) {
+	PERFTMP_SCOPE(__PRETTY_FUNCTION__); // PERFTMP
+	(void)Dispatch(submit_id, buffer, thread_group_x, thread_group_y, thread_group_z, mode, 0);
+}
+
+bool RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
+                                      uint64_t args_address, uint32_t mode) {
+	EXIT_IF(args_address == 0);
+	return Dispatch(submit_id, buffer, 0, 0, 0, mode, args_address);
+}
+
+// indirect_args != 0: the group counts are the three dwords at that guest address.
+bool RenderExecutor::Dispatch(uint64_t submit_id, CommandBuffer& buffer, uint32_t thread_group_x,
+                              uint32_t thread_group_y, uint32_t thread_group_z, uint32_t mode,
+                              uint64_t indirect_args) {
 	EXIT_IF(buffer.IsInvalid());
 	m_context.GetCommandScheduler().PopPendingOperations();
 	auto& ctx    = buffer.GetRegisters();
@@ -210,7 +245,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	                    thread_group_x, thread_group_y, thread_group_z, mode,
 	                    sh_ctx.GetCs().cs_regs.data_addr);
 
-	if (thread_group_x == 0 || thread_group_y == 0 || thread_group_z == 0) {
+	if (indirect_args == 0 && (thread_group_x == 0 || thread_group_y == 0 || thread_group_z == 0)) {
 		static std::atomic<uint32_t> log_count {0};
 		if (log_count.fetch_add(1, std::memory_order_relaxed) < 32) {
 			LOGF("GraphicsRenderDispatchDirect: skipping zero-sized dispatch groups=%ux%ux%u "
@@ -218,7 +253,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 			     thread_group_x, thread_group_y, thread_group_z, mode,
 			     sh_ctx.GetCs().cs_regs.data_addr);
 		}
-		return;
+		return true;
 	}
 
 	Common::LockGuard lock(m_context.GetMutex());
@@ -226,11 +261,11 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		LOGF("GraphicsRenderDispatchDirect: temporary: ignoring dispatch with null CS shader, "
 		     "groups=%ux%ux%u mode=%u\n",
 		     thread_group_x, thread_group_y, thread_group_z, mode);
-		return;
+		return true;
 	}
 
 	if (sh_ctx.GetCs().cs_regs.data_addr == 0) {
-		return;
+		return true;
 	}
 
 	constexpr uint32_t DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS = 1u << 5u;
@@ -257,8 +292,15 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	ShaderComputeInputInfo input_info {};
 	const bool use_thread_dimensions      = (mode & DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0;
 	input_info.dispatch_thread_dimensions = use_thread_dimensions;
-	const auto compute_program =
-	    m_context.GetPipelineCache().GetComputeProgram(cs_regs, sh_regs, input_info);
+	// An indirect dispatch may have zero groups and state the game never meant to run, so only
+	// run shaders already known to work and fall back to reading the counts otherwise.
+	const auto compute_program = m_context.GetPipelineCache().GetComputeProgram(
+	    cs_regs, sh_regs, input_info, indirect_args != 0 && !use_thread_dimensions);
+	if (!compute_program) {
+		EXIT_IF(indirect_args == 0 || use_thread_dimensions);
+		ResetBindings();
+		return false;
+	}
 	if (use_thread_dimensions) {
 		input_info.dispatch_threads_num[0] = thread_group_x;
 		input_info.dispatch_threads_num[1] = thread_group_y;
@@ -267,14 +309,25 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 
 	const auto& program   = *input_info.stage.program;
 	const auto& resources = input_info.stage.resources;
+	if (indirect_args != 0 &&
+	    (use_thread_dimensions ||
+	     resources.uniform_fill.kind != ShaderRecompiler::IR::UniformFillKind::None)) {
+		ResetBindings();
+		return false;
+	}
 	if (TryConsumeComputeMetaClear(input_info, buffer)) {
 		ResetBindings();
-		return;
+		return true;
 	}
-	if (TryConsumeComputeImageClear(input_info, buffer, thread_group_x, thread_group_y,
-	                                thread_group_z, mode)) {
+	if (indirect_args == 0 && TryConsumeComputeImageClear(input_info, buffer, thread_group_x,
+	                                                      thread_group_y, thread_group_z, mode)) {
 		ResetBindings();
-		return;
+		return true;
+	}
+	if (indirect_args == 0 && TryConsumeComputeMetadataFill(input_info, buffer, thread_group_x,
+	                                                        thread_group_y, thread_group_z, mode)) {
+		ResetBindings();
+		return true;
 	}
 	const bool large_workgroup =
 	    (input_info.threads_num[0] * input_info.threads_num[1] * input_info.threads_num[2] >= 512);
@@ -364,7 +417,12 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 
 	buffer.EndRendering();
 	auto& pipeline = m_context.GetPipelineCache().GetComputePipeline(input_info, compute_program);
-	auto  bindings = PrepareBindings(input_info.stage);
+	constexpr uint64_t IndirectArgsSize = 3u * sizeof(uint32_t);
+	if (indirect_args != 0) {
+		// Register the counts first so binding the shader's buffers cannot re-home them.
+		(void)m_context.GetBufferCache().FindBuffer(indirect_args, IndirectArgsSize);
+	}
+	auto bindings = PrepareBindings(input_info.stage);
 	FindBuffers(bindings);
 	if (program.info.uses_dma) {
 		m_context.PrepareBda();
@@ -388,14 +446,32 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	if (has_storage_writes) {
 		// A host fence used to serialize every dispatch. Preserve its read-before-write ordering
 		// while allowing the queue to execute asynchronously.
-		ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+		if (std::getenv("KYTY_NOBARRIER") == nullptr)
+			ShaderWriteHazardBarrier(vk_buffer,
+			                         vk::PipelineStageFlagBits::eComputeShader); // PERFTMP
 	}
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
-	vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
+	if (indirect_args != 0) {
+		auto [args_buffer, args_offset] =
+		    m_context.GetBufferCache().ObtainBuffer(indirect_args, IndirectArgsSize, false);
+		// Earlier shader and transfer writes produced the counts; make them visible to the
+		// indirect command read.
+		vk::MemoryBarrier barrier {};
+		barrier.srcAccessMask = vk::AccessFlagBits::eMemoryWrite;
+		barrier.dstAccessMask = vk::AccessFlagBits::eIndirectCommandRead;
+		vk_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+		                          vk::PipelineStageFlagBits::eDrawIndirect, {}, 1, &barrier, 0,
+		                          nullptr, 0, nullptr);
+		vk_buffer.dispatchIndirect(args_buffer->Handle(), args_offset);
+	} else {
+		vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
+	}
 
 	// The removed host fence also ordered read-only dispatches before later writers.
-	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+	if (std::getenv("KYTY_NOBARRIER") == nullptr)
+		ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader); // PERFTMP
 	ResetBindings();
+	return true;
 }
 
 } // namespace Libs::Graphics

@@ -703,8 +703,50 @@ bool Translator::DS_ATOMIC(const Decoder::Instruction& inst, IR::ValueOpcode opc
 	return true;
 }
 
+// PS5 flat addresses whose high dword is the shared aperture reach LDS at the low dword
+// (ray-tracing traversal keeps its stack there).
+static constexpr uint32_t FlatSharedApertureHigh = 0x80000000u;
+
+IR::MemoryInfo Translator::FlatSharedMemory(const IR::MemoryInfo& memory, uint32_t index) {
+	auto shared            = memory;
+	shared.kind            = IR::ResourceKind::Lds;
+	shared.offset          = memory.offset + index * 4u;
+	shared.data_dwords     = 1u;
+	shared.component_count = 1u;
+	shared.component_index = 0u;
+	shared.address_is_full = false;
+	shared.resource        = 0u;
+	shared.sampler         = 0u;
+	return shared;
+}
+
 bool Translator::FLAT_LOAD(const Decoder::Instruction& inst) {
-	const auto      memory = MemoryInfoFromDecoded(inst);
+	const auto memory = MemoryInfoFromDecoded(inst);
+	if (memory.kind == IR::ResourceKind::Flat && memory.data_bits == 32u) {
+		const auto address = ReadAddressOperands(inst, 0);
+		const auto exec    = ir.GetExec();
+		const auto is_shared =
+		    ir.Emit(IR::ValueOpcode::IEqual32, {address.high, IR::Value(FlatSharedApertureHigh)});
+		const auto shared_active = ir.Emit(IR::ValueOpcode::LogicalAnd, {exec, is_shared});
+		const auto global_active = ir.Emit(
+		    IR::ValueOpcode::LogicalAnd, {exec, ir.Emit(IR::ValueOpcode::LogicalNot, {is_shared})});
+		for (uint32_t index = 0; index < std::min(memory.data_dwords, 4u); index++) {
+			auto component = memory;
+			component.offset += index * 4u;
+			component.data_dwords     = 1u;
+			component.component_index = index;
+			const auto global =
+			    ir.Emit(IR::ValueOpcode::LoadAddressU32,
+			            {address.resource, address.low, address.high, global_active},
+			            AddMemoryInfo(component, inst.pc));
+			const auto shared =
+			    ir.Emit(IR::ValueOpcode::LoadSharedU32, {address.low, shared_active},
+			            AddMemoryInfo(FlatSharedMemory(memory, index), inst.pc));
+			WriteOperand(OffsetOperand(inst.dst, index),
+			             ir.Emit(IR::ValueOpcode::SelectU32, {is_shared, shared, global}));
+		}
+		return true;
+	}
 	IR::ValueOpcode opcode;
 	const auto      bits = memory.data_bits;
 	const auto      sign = memory.data_signed;
@@ -731,9 +773,22 @@ bool Translator::FLAT_LOAD(const Decoder::Instruction& inst) {
 }
 
 bool Translator::FLAT_STORE(const Decoder::Instruction& inst) {
-	const auto      memory  = MemoryInfoFromDecoded(inst);
-	const auto      data_op = MemorySourceAt(inst, 0);
-	const auto      address = ReadAddressOperands(inst, 1);
+	const auto memory  = MemoryInfoFromDecoded(inst);
+	const auto data_op = MemorySourceAt(inst, 0);
+	const auto address = ReadAddressOperands(inst, 1);
+	if (memory.kind == IR::ResourceKind::Flat && memory.data_bits == 32u) {
+		// Only the shared aperture is written: device-memory stores through FLAT have no GPU
+		// ownership tracking yet, and dropping them beats failing the whole shader.
+		const auto is_shared =
+		    ir.Emit(IR::ValueOpcode::IEqual32, {address.high, IR::Value(FlatSharedApertureHigh)});
+		const auto active = ir.Emit(IR::ValueOpcode::LogicalAnd, {ir.GetExec(), is_shared});
+		for (uint32_t index = 0; index < memory.data_dwords; index++) {
+			ir.Emit(IR::ValueOpcode::WriteSharedU32,
+			        {address.low, ReadU32(OffsetOperand(data_op, index)), active},
+			        AddMemoryInfo(FlatSharedMemory(memory, index), inst.pc));
+		}
+		return true;
+	}
 	IR::ValueOpcode opcode;
 	switch (memory.data_bits) {
 		case 8u: opcode = IR::ValueOpcode::StoreAddressU8; break;
@@ -775,6 +830,15 @@ bool Translator::IMAGE_GET_LOD(const Decoder::Instruction& inst) {
 	const auto result   = ir.Emit(IR::ValueOpcode::ImageQueryLod, {resource, sampler, address},
 	                              AddMemoryInfo(memory, inst.pc));
 	WriteImageComponents(inst.dst, result, memory, 2u);
+	return true;
+}
+
+// Ray-BVH intersection is not emulated yet: every node reports no hit (all child and triangle
+// results 0xffffffff), so traversal ends at once and ray-traced effects see empty scenes.
+bool Translator::IMAGE_BVH_INTERSECT_RAY(const Decoder::Instruction& inst) {
+	for (uint32_t index = 0; index < 4u; index++) {
+		WriteOperand(OffsetOperand(inst.dst, index), IR::Value(0xffffffffu));
+	}
 	return true;
 }
 
@@ -1208,6 +1272,7 @@ bool Translator::EmitMemory(const Decoder::Instruction& inst) {
 
 		case Decoder::Opcode::IMAGE_GET_RESINFO: return IMAGE_GET_RESINFO(inst);
 		case Decoder::Opcode::IMAGE_GET_LOD: return IMAGE_GET_LOD(inst);
+		case Decoder::Opcode::IMAGE_BVH_INTERSECT_RAY: return IMAGE_BVH_INTERSECT_RAY(inst);
 		case Decoder::Opcode::IMAGE_LOAD:
 		case Decoder::Opcode::IMAGE_LOAD_MIP: return IMAGE_LOAD(inst);
 		case Decoder::Opcode::IMAGE_STORE:
