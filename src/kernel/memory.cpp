@@ -8,6 +8,7 @@
 #include "common/virtualMemory.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
 
@@ -878,6 +879,8 @@ static uint64_t FindGuestFreeRange(uint64_t search_addr, uint64_t size, uint64_t
 }
 
 bool TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size) {
+	// Host writes behind the guest (GPU write-backs) change what descriptor tables read.
+	Graphics::ShaderRecompiler::IR::InvalidateDescriptorTableCache(vaddr, size);
 	return g_guest_address_space != nullptr &&
 	       g_guest_address_space->TryWriteBacking(vaddr, data, size);
 }
@@ -918,16 +921,21 @@ bool IsGpuBufferOwned(uint64_t vaddr, uint64_t size) {
 	       !GetGpuResources().GetTextureCache().IsRegionGpuModified(vaddr, size);
 }
 
+bool IsGpuRangeBusy(uint64_t vaddr, uint64_t size) {
+	return g_gpu_resources != nullptr && IsGpuAddressRange(vaddr, size) &&
+	       (!Graphics::GuestGpu::IsGpuThread() ||
+	        GetGpuResources().GetTextureCache().IsRegionGpuModified(vaddr, size) ||
+	        GetGpuResources().GetBufferCache().HasGpuDirtyBytes(vaddr, size));
+}
+
+bool WatchGpuMemoryWrites(uint64_t vaddr, uint64_t size) {
+	return g_gpu_resources != nullptr && GetGpuResources().WatchDescriptorTableMemory(vaddr, size);
+}
+
 // Like TryReadGpuCleanBacking, but refuses a range the GPU still owns any part of instead of
 // flushing it, so a caller reading more than it needs never waits on unrelated GPU work.
 bool TryReadGpuIdleBacking(uint64_t vaddr, void* data, uint64_t size) {
-	if (g_gpu_resources != nullptr && IsGpuAddressRange(vaddr, size) &&
-	    (!Graphics::GuestGpu::IsGpuThread() ||
-	     GetGpuResources().GetTextureCache().IsRegionGpuModified(vaddr, size) ||
-	     GetGpuResources().GetBufferCache().HasGpuDirtyBytes(vaddr, size))) {
-		return false;
-	}
-	return TryReadBacking(vaddr, data, size);
+	return !IsGpuRangeBusy(vaddr, size) && TryReadBacking(vaddr, data, size);
 }
 
 uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size) {

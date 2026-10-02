@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "common/perfTmp.h" // PERFTMP
 #include "graphics/shader/recompiler/Tessellation.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 #include "graphics/shader/recompiler/frontend/cfg/ShaderCFG.h"
@@ -474,7 +475,8 @@ Decoder::Program DecodeFusedProgram(std::span<const uint32_t> front, std::span<c
 
 } // namespace
 
-TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOptions& options) {
+std::shared_ptr<const PreparedProgram> PrepareProgram(std::span<const uint32_t> code,
+                                                      const CompileOptions&     options) {
 	if (code.empty()) {
 		EXIT("shader recompiler input is empty\n");
 	}
@@ -497,35 +499,39 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
 	     static_cast<uint64_t>(code.size()));
 
-	Decoder::Program      decoded;
-	std::vector<uint32_t> joined_code;
+	auto  prepared = std::make_shared<PreparedProgram>();
+	auto& decoded  = prepared->decoded;
 	if (!options.back_code.empty()) {
-		decoded = DecodeFusedProgram(code, options.back_code, joined_code);
+		decoded = DecodeFusedProgram(code, options.back_code, prepared->code);
 	} else if (options.stage == ShaderType::Local) {
-		decoded = Decoder::DecodeFrontProgram(code);
+		// The cached program outlives the guest code it was decoded from.
+		prepared->code.assign(code.begin(), code.end());
+		decoded = Decoder::DecodeFrontProgram(prepared->code);
 		// The separately compiled hull half runs in the next Vulkan stage.
 		auto& handoff     = decoded.instructions.back();
 		handoff.opcode    = Decoder::Opcode::S_ENDPGM;
 		handoff.src_count = 0;
 	} else {
-		Decoder::DecodeProgram(code, decoded);
+		prepared->code.assign(code.begin(), code.end());
+		Decoder::DecodeProgram(prepared->code, decoded);
 	}
 	LOGF("%s phase end: stage=%s hash=0x%016" PRIx64 " decode instructions=%" PRIu64
 	     " elapsed_ms=%" PRIu64 "\n",
 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
 	     static_cast<uint64_t>(decoded.instructions.size()), phase_ms());
 
-	std::string decoded_dump;
 	if (options.dump_ir) {
-		decoded_dump = Decoder::ProgramToString(decoded);
+		prepared->decoded_dump = Decoder::ProgramToString(decoded);
 		if (options.early_dump) {
-			LOGF("%s decoded RDNA2 (early):\n%s", GetDumpLabel(options), decoded_dump.c_str());
+			LOGF("%s decoded RDNA2 (early):\n%s", GetDumpLabel(options),
+			     prepared->decoded_dump.c_str());
 		}
 	}
 
 	LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " CFG BuildGraph\n", GetDumpLabel(options),
 	     StageName(options.stage), options.shader_hash);
-	auto cfg = CFG::BuildGraph(decoded);
+	prepared->cfg = CFG::BuildGraph(decoded);
+	auto& cfg     = prepared->cfg;
 	LOGF("%s phase end: stage=%s hash=0x%016" PRIx64 " CFG BuildGraph blocks=%" PRIu64
 	     " loops=%" PRIu64 " back_edges=%" PRIu64 " elapsed_ms=%" PRIu64 "\n",
 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
@@ -548,6 +554,22 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 		     static_cast<uint64_t>(cfg.blocks.size()),
 		     static_cast<uint64_t>(cfg.natural_loops.size()), phase_ms());
 	}
+	return prepared;
+}
+
+TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOptions& options) {
+	return TranslateProgram(*PrepareProgram(code, options), options);
+}
+
+TranslateResult TranslateProgram(const PreparedProgram& prepared, const CompileOptions& options) {
+	const auto translate_begin = std::chrono::steady_clock::now();
+	const auto phase_ms        = [&translate_begin]() {
+		return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+		                                 std::chrono::steady_clock::now() - translate_begin)
+		                                 .count());
+	};
+	const auto& decoded = prepared.decoded;
+	const auto& cfg     = prepared.cfg;
 
 	Frontend::EmbeddedFetchPlan embedded_fetch;
 	if ((options.stage == ShaderType::Vertex || options.stage == ShaderType::Local) &&
@@ -571,34 +593,82 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 	};
 	LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " IR TranslateProgram\n",
 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash);
-	auto ir = Frontend::TranslateProgram(decoded, cfg, translate_options);
+	auto ir = [&] {
+		PERFTMP_SCOPE("xlate: Frontend::TranslateProgram");
+		return Frontend::TranslateProgram(decoded, cfg, translate_options);
+	}(); // PERFTMP
 	LOGF("%s phase end: stage=%s hash=0x%016" PRIx64 " IR TranslateProgram blocks=%" PRIu64
 	     " elapsed_ms=%" PRIu64 "\n",
 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
 	     static_cast<uint64_t>(ir.blocks.size()), phase_ms());
-	IR::RewriteToSsa(ir.blocks);
-	IR::ConstantPropagationPass(ir.blocks);
-	IR::ResolveControlFlowIdentities(ir);
-	IR::RemoveIdentities(ir.blocks);
-	IR::EliminateDeadCode(ir.blocks);
-	const auto read_lane_stats = IR::EliminateReadLane(ir, ir.wave_size);
+	{
+		PERFTMP_SCOPE("xlate: IR::RewriteToSsa");
+		IR::RewriteToSsa(ir.blocks);
+	} // PERFTMP
+	{
+		PERFTMP_SCOPE("xlate: IR::ConstantPropagationPass");
+		IR::ConstantPropagationPass(ir.blocks);
+	} // PERFTMP
+	{
+		PERFTMP_SCOPE("xlate: IR::ResolveControlFlowIdentities");
+		IR::ResolveControlFlowIdentities(ir);
+	} // PERFTMP
+	{
+		PERFTMP_SCOPE("xlate: IR::RemoveIdentities");
+		IR::RemoveIdentities(ir.blocks);
+	} // PERFTMP
+	{
+		PERFTMP_SCOPE("xlate: IR::EliminateDeadCode");
+		IR::EliminateDeadCode(ir.blocks);
+	} // PERFTMP
+	const auto read_lane_stats = [&] {
+		PERFTMP_SCOPE("xlate: IR::EliminateReadLane");
+		return IR::EliminateReadLane(ir, ir.wave_size);
+	}(); // PERFTMP
 	if (read_lane_stats.rewritten_reads != 0) {
 		LOGF("%s read-lane elimination: reads=%" PRIu32 "\n", GetDumpLabel(options),
 		     read_lane_stats.rewritten_reads);
-		IR::ConstantPropagationPass(ir.blocks);
-		IR::ResolveControlFlowIdentities(ir);
-		IR::RemoveIdentities(ir.blocks);
-		IR::EliminateDeadCode(ir.blocks);
+		{
+			PERFTMP_SCOPE("xlate: IR::ConstantPropagationPass");
+			IR::ConstantPropagationPass(ir.blocks);
+		} // PERFTMP
+		{
+			PERFTMP_SCOPE("xlate: IR::ResolveControlFlowIdentities");
+			IR::ResolveControlFlowIdentities(ir);
+		} // PERFTMP
+		{
+			PERFTMP_SCOPE("xlate: IR::RemoveIdentities");
+			IR::RemoveIdentities(ir.blocks);
+		} // PERFTMP
+		{
+			PERFTMP_SCOPE("xlate: IR::EliminateDeadCode");
+			IR::EliminateDeadCode(ir.blocks);
+		} // PERFTMP
 	}
-	LowerTessellationMemory(ir, options);
-	IR::BuildSrtPlan(ir);
-	IR::EliminateDeadCode(ir.blocks);
-	IR::TrackResources(ir);
-	IR::EliminateDeadCode(ir.blocks);
+	{
+		PERFTMP_SCOPE("xlate: LowerTessellationMemory");
+		LowerTessellationMemory(ir, options);
+	} // PERFTMP
+	{
+		PERFTMP_SCOPE("xlate: IR::BuildSrtPlan");
+		IR::BuildSrtPlan(ir);
+	} // PERFTMP
+	{
+		PERFTMP_SCOPE("xlate: IR::EliminateDeadCode");
+		IR::EliminateDeadCode(ir.blocks);
+	} // PERFTMP
+	{
+		PERFTMP_SCOPE("xlate: IR::TrackResources");
+		IR::TrackResources(ir);
+	} // PERFTMP
+	{
+		PERFTMP_SCOPE("xlate: IR::EliminateDeadCode");
+		IR::EliminateDeadCode(ir.blocks);
+	} // PERFTMP
 	TranslateResult result;
 	result.program = std::move(ir);
 	if (options.dump_ir) {
-		result.decoded_dump = std::move(decoded_dump);
+		result.decoded_dump = prepared.decoded_dump;
 		result.cfg_dump     = CFG::GraphToString(cfg);
 	}
 	return result;

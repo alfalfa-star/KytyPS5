@@ -12,6 +12,7 @@ class Value;
 using SrtMemoryReader = bool (*)(void* userdata, uint64_t address, uint32_t* value);
 // True when only the GPU holds the current value of the dword at address (in a buffer).
 using SrtGpuOwnedQuery = bool (*)(void* userdata, uint64_t address);
+using SrtGpuRangeQuery = bool (*)(void* userdata, uint64_t address, uint64_t size);
 
 struct SrtRuntime {
 	std::span<const uint32_t> user_data;
@@ -22,6 +23,12 @@ struct SrtRuntime {
 	// Optional: flattened SRT words the host never evaluates itself and the GPU owns are
 	// returned as GpuFlatRead records instead of being read.
 	SrtGpuOwnedQuery gpu_owned = nullptr;
+	// Optional: whether the GPU owns part of a range right now. Descriptor tables read from
+	// memory are reused across draws only when this is set (see ResourceMaterialization.h).
+	SrtGpuRangeQuery gpu_busy = nullptr;
+	// Required with gpu_busy: arranges for CPU writes to a range to invalidate cached tables
+	// (InvalidateDescriptorTableCache); false when it cannot.
+	SrtGpuRangeQuery watch_writes = nullptr;
 };
 
 enum class RuntimeValueType { Any, Integer };

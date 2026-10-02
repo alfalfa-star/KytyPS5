@@ -49,6 +49,14 @@ ResourcePlan ExtractResourcePlan(const Program& program);
 bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
                           ResourceSnapshot& snapshot, ResourceSpecialization& specialization);
 
+// Descriptor tables enumerated from guest memory are reused across draws while that memory
+// cannot have changed: until the next call to this (the renderer calls it whenever guest memory
+// may have been written behind the GPU's back: a new submission, a CP memory write, a GPU
+// write-back), and only while the GPU does not own part of the memory the table was read from.
+void InvalidateDescriptorTableCache();
+// Same, but only when a cached table was read from [address, address + size).
+void InvalidateDescriptorTableCache(uint64_t address, uint64_t size);
+
 // Applies an already-derived specialization to native IR before layout and emission.
 void ApplyResourceSpecialization(Program& program, const ResourceSpecialization& specialization);
 

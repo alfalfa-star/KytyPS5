@@ -6,3 +6,8 @@ _Build/vscode-clang/
 _Build/
 cmake-build-debug/
 _PipelineCache/
+
+# Emulator runtime output
+_SaveData/
+_DownloadData/
+_kyty.txt

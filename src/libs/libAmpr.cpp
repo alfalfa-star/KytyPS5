@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <cstdio> // PERFTMP
 #include <cstring>
@@ -1321,11 +1322,47 @@ static bool AppendAmmMapRecord(uint64_t                                 command_
 static int ReadHostFileToGuest(const std::string& host_path, uint64_t file_offset,
                                uint64_t destination, uint64_t size, uint64_t* bytes_read);
 
+// Reads complete no earlier than an SSD would finish them. Games stream while they play, and the
+// emulator runs them far slower than hardware: completing every read instantly lets streaming
+// finish long before the game expects it to (Ghost of Yotei then never leaves its first
+// cutscene). Completion signals of a command buffer wait for this pacing.
+class AprPacing {
+public:
+	static constexpr uint64_t LatencyMicros  = 2000;
+	static constexpr uint64_t BytesPerSecond = 1024ull * 1024 * 1024;
+
+	void AddBytes(uint64_t bytes) { m_bytes += bytes; }
+
+	void Wait() const {
+		static const uint64_t latency = [] { // PERFTMP: tuning overrides
+			const char* e = std::getenv("KYTY_APR_LATENCY_US");
+			return e != nullptr ? std::strtoull(e, nullptr, 10) : LatencyMicros;
+		}();
+		static const uint64_t bytes_per_second = [] { // PERFTMP
+			const char* e = std::getenv("KYTY_APR_MBPS");
+			return e != nullptr ? std::strtoull(e, nullptr, 10) * 1024 * 1024 : BytesPerSecond;
+		}();
+		PERFTMP_SCOPE("apr pacing wait"); // PERFTMP
+		const auto target = m_start + std::chrono::microseconds(latency) +
+		                    std::chrono::microseconds(m_bytes * 1000000ull / bytes_per_second);
+		const auto now    = std::chrono::steady_clock::now();
+		if (now < target) {
+			Common::Thread::SleepMicro(static_cast<uint32_t>(
+			    std::chrono::duration_cast<std::chrono::microseconds>(target - now).count()));
+		}
+	}
+
+private:
+	std::chrono::steady_clock::time_point m_start = std::chrono::steady_clock::now();
+	uint64_t                              m_bytes = 0;
+};
+
 static int ExecuteAprCommandBuffer(uint64_t command_buffer, int32_t* execution_result,
                                    uint32_t* error_offset) {
 	if (execution_result == nullptr || error_offset == nullptr) {
 		return LibKernel::KERNEL_ERROR_EINVAL;
 	}
+	AprPacing pacing;
 
 	*execution_result = OK;
 	*error_offset     = 0;
@@ -1395,6 +1432,7 @@ static int ExecuteAprCommandBuffer(uint64_t command_buffer, int32_t* execution_r
 				uint64_t bytes_read = 0;
 				auto result = ReadHostFileToGuest(host_path, command.file_offset,
 				                                  command.destination, command.size, &bytes_read);
+				pacing.AddBytes(bytes_read);
 				if (result != OK) {
 					LOGF("\tAPR submit read failed: id=0x%08" PRIx32 ", result=0x%08" PRIx32
 					     ", path=%s\n",
@@ -1405,6 +1443,7 @@ static int ExecuteAprCommandBuffer(uint64_t command_buffer, int32_t* execution_r
 				}
 			} break;
 			case CommandKind::KernelEvent: {
+				pacing.Wait();
 				const auto& command = state.kernel_event_commands[entry.index];
 				const auto  eq      = static_cast<LibKernel::EventQueue::KernelEqueue>(command.eq);
 				auto        result  = LibKernel::EventQueue::KernelTriggerUserEvent(
@@ -1419,6 +1458,7 @@ static int ExecuteAprCommandBuffer(uint64_t command_buffer, int32_t* execution_r
 				}
 			} break;
 			case CommandKind::WriteAddress: {
+				pacing.Wait();
 				const auto& command = state.write_address_commands[entry.index];
 				if (!AprShared::WriteGuest(command.address, command.value)) {
 					LOGF("\tAMPR submit write-address failed: address=0x%016" PRIx64
@@ -1453,6 +1493,7 @@ static int ExecuteAprCommandBuffer(uint64_t command_buffer, int32_t* execution_r
 		}
 	}
 
+	pacing.Wait();
 	return OK;
 }
 

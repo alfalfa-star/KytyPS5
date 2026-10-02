@@ -110,6 +110,11 @@ void SetFlexibleMemorySize(uint64_t size);
 bool TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size);
 bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size);
 bool TryReadGpuCleanBacking(uint64_t vaddr, void* data, uint64_t size);
+// Whether the host GPU owns part of the range now (or the caller is not the GPU thread, which
+// cannot tell).
+bool IsGpuRangeBusy(uint64_t vaddr, uint64_t size);
+// Invalidates cached descriptor tables on the next CPU write to the range (GPU memory only).
+bool WatchGpuMemoryWrites(uint64_t vaddr, uint64_t size);
 bool TryReadGpuIdleBacking(uint64_t vaddr, void* data, uint64_t size);
 // On the GPU thread: part of the range is newer in a GPU buffer than in guest memory.
 bool                   IsGpuBufferOwned(uint64_t vaddr, uint64_t size);

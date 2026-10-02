@@ -4,6 +4,7 @@
 #include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/logging/log.h"
+#include "common/perfTmp.h" // PERFTMP
 #include "common/profiler.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
@@ -24,8 +25,10 @@
 #include <cctype>
 #include <cstdio>
 #include <cstring>
+#include <deque>
 #include <fmt/format.h>
 #include <limits>
+#include <memory>
 #include <span>
 #include <spirv-tools/libspirv.hpp>
 #include <string_view>
@@ -157,6 +160,7 @@ private:
 	}
 
 	const Page* Load(uint64_t base) {
+		PERFTMP_SCOPE("mat: page cache Load (4 KiB)"); // PERFTMP
 		Page page {.base = base, .words = std::vector<uint32_t>(PageSize / sizeof(uint32_t))};
 		if (!Libs::LibKernel::Memory::TryReadGpuIdleBacking(base, page.words.data(), PageSize)) {
 			page.words.clear();
@@ -270,13 +274,14 @@ struct PipelineCache::ProgramCache {
 	};
 
 	struct SourceEntry {
-		explicit SourceEntry(ShaderRecompiler::IR::ResourcePlan plan)
-		    : resource_plan(std::move(plan)) {
-			permutations.reserve(8);
-		}
+		SourceEntry(ShaderRecompiler::IR::ResourcePlan                       plan,
+		            std::shared_ptr<const ShaderRecompiler::PreparedProgram> prepared)
+		    : resource_plan(std::move(plan)), prepared(std::move(prepared)) {}
 
-		ShaderRecompiler::IR::ResourcePlan resource_plan;
-		std::vector<Permutation>           permutations;
+		ShaderRecompiler::IR::ResourcePlan                       resource_plan;
+		std::shared_ptr<const ShaderRecompiler::PreparedProgram> prepared;
+		// Deque: bound stages keep pointers to their permutation's program.
+		std::deque<Permutation> permutations;
 	};
 
 	struct ProgramKeyHash {
@@ -313,6 +318,7 @@ struct PipelineCache::ProgramCache {
 			case ShaderType::Compute: stage_name = "cs"; break;
 			default: EXIT("invalid pipeline shader stage\n");
 		}
+		PERFTMP_SCOPE("shader: CompileProgram (IR->SPIR-V)"); // PERFTMP
 		auto result = ShaderRecompiler::CompileProgram(std::move(translated), options,
 		                                               specialization, push_data_start_dword);
 		DumpShaderOriginal(stage_name, options.shader_hash, params.code, result.decoded_dump);
@@ -375,6 +381,14 @@ struct PipelineCache::ProgramCache {
 		    .gpu_owned =
 		        [](void*, uint64_t address) {
 			        return Libs::LibKernel::Memory::IsGpuBufferOwned(address, sizeof(uint32_t));
+		        },
+		    .gpu_busy =
+		        [](void*, uint64_t address, uint64_t size) {
+			        return Libs::LibKernel::Memory::IsGpuRangeBusy(address, size);
+		        },
+		    .watch_writes =
+		        [](void*, uint64_t address, uint64_t size) {
+			        return Libs::LibKernel::Memory::WatchGpuMemoryWrites(address, size);
 		        },
 		};
 		if (speculative && entry == programs.end()) {
@@ -445,7 +459,15 @@ struct PipelineCache::ProgramCache {
 		} else {
 			options.wave_size = input_info.wave_size;
 		}
-		auto translated = ShaderRecompiler::TranslateProgram(params.code, options);
+		// Every permutation shares the decoded program and its structured CFG.
+		auto prepared   = entry != programs.end() ? entry->second.prepared : [&] { // PERFTMP
+			PERFTMP_SCOPE("shader: PrepareProgram (decode+CFG)");
+			return ShaderRecompiler::PrepareProgram(params.code, options);
+		}();
+		auto translated = [&] {                        // PERFTMP
+			PERFTMP_SCOPE("shader: TranslateProgram"); // PERFTMP
+			return ShaderRecompiler::TranslateProgram(*prepared, options);
+		}();
 		if (entry == programs.end()) {
 			auto resource_plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
 			if (!ShaderRecompiler::IR::MaterializeResources(resource_plan, runtime, resources,
@@ -453,11 +475,57 @@ struct PipelineCache::ProgramCache {
 				EXIT("resource materialization failed for shader hash=0x%016" PRIx64 "\n",
 				     params.hash);
 			}
-			entry = programs.try_emplace(lookup_key, std::move(resource_plan)).first;
+			entry = programs.try_emplace(lookup_key, std::move(resource_plan), std::move(prepared))
+			            .first;
 		}
 		entry->second.permutations.push_back(CompilePermutation(
 		    params, options, std::move(translated), std::move(specialization), push_data_cursor));
 		const auto& permutation = entry->second.permutations.back();
+		{ // PERFTMP
+			const auto& first = entry->second.permutations.front();
+			std::string why;
+			if (first.program.bindings.push_data_start_dword !=
+			    permutation.program.bindings.push_data_start_dword) {
+				why += " push";
+			}
+			const auto& a = first.specialization;
+			const auto& b = permutation.specialization;
+			for (size_t i = 0; i < a.images.size() && i < b.images.size(); i++) {
+				const auto& x = a.images[i];
+				const auto& y = b.images[i];
+				if (x.numeric_class != y.numeric_class) why += fmt::format(" img{}.class", i);
+				if (x.dimension != y.dimension) why += fmt::format(" img{}.dim", i);
+				if (x.mip_count != y.mip_count)
+					why += fmt::format(" img{}.mip{}/{}", i, x.mip_count, y.mip_count);
+				if (x.conversion_format != y.conversion_format)
+					why += fmt::format(" img{}.conv", i);
+				if (x.shader_swizzle != y.shader_swizzle) why += fmt::format(" img{}.swz", i);
+				if (x.indirect_root != y.indirect_root ||
+				    x.indirect_mapping_offset != y.indirect_mapping_offset ||
+				    x.indirect_search_iterations != y.indirect_search_iterations)
+					why += fmt::format(" img{}.indirect", i);
+				if (x.cube != y.cube || x.fmask != y.fmask)
+					why += fmt::format(" img{}.cube/fmask", i);
+			}
+			for (size_t i = 0; i < a.buffers.size() && i < b.buffers.size(); i++) {
+				const auto& x = a.buffers[i];
+				const auto& y = b.buffers[i];
+				if (x.packed_stride != y.packed_stride) why += fmt::format(" buf{}.stride", i);
+				if (x.descriptor_format != y.descriptor_format) why += fmt::format(" buf{}.fmt", i);
+				if (x.descriptor_swizzle != y.descriptor_swizzle)
+					why += fmt::format(" buf{}.swz", i);
+				if (x.indirect_root != y.indirect_root ||
+				    x.indirect_mapping_offset != y.indirect_mapping_offset ||
+				    x.indirect_search_iterations != y.indirect_search_iterations ||
+				    x.indirect_arena != y.indirect_arena ||
+				    x.indirect_arena_offset != y.indirect_arena_offset)
+					why += fmt::format(" buf{}.indirect", i);
+			}
+			if (a.images.size() != b.images.size() || a.buffers.size() != b.buffers.size())
+				why += " counts";
+			std::fprintf(stderr, "PERFTMP perm hash=%016" PRIx64 " n=%zu why:%s\n", params.hash,
+			             entry->second.permutations.size(), why.c_str());
+		}
 		input_info.stage = {.program = &permutation.program, .resources = std::move(resources)};
 		permutation.program.bindings.AdvancePushData(push_data_cursor);
 

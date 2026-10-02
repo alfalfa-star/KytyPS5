@@ -6,6 +6,7 @@
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/regionDefinitions.h"
 
+#include <array>
 #include <atomic>
 #include <mutex>
 #include <utility>
@@ -106,6 +107,11 @@ public:
 				EXIT("GPU dirty state conflicts with CPU dirty state\n");
 			}
 		}
+		if constexpr (source == DirtySource::Gpu && enable) {
+			for (auto page = start; page < end; page++) {
+				m_gpu_generation[page]++;
+			}
+		}
 		auto& bits = GetBits<source>();
 		if constexpr (enable) {
 			bits.SetRange(start, end);
@@ -137,20 +143,62 @@ public:
 		}
 	}
 
+	// Counts how often a page was marked GPU-modified; read and compare under `lock`.
+	[[nodiscard]] uint32_t GpuGeneration(uint64_t vaddr) const {
+		return m_gpu_generation[GetPageRange(vaddr, 1).first];
+	}
+
+	// Lets the CPU read a GPU-modified page whose data guest memory already holds, unless the
+	// page was marked again since `generation`. The page stays GPU-modified (and write
+	// protected); its next protection update, or any new GPU mark, watches reads again.
+	bool AllowReadIfUnchanged(uint64_t vaddr, uint32_t generation) {
+		const auto page = GetPageRange(vaddr, 1).first;
+		if (!m_gpu_dirty.Get(page) || m_readable.Get(page) ||
+		    m_gpu_generation[page] != generation) {
+			return false;
+		}
+		m_readable.Set(page);
+		RegionBits mask;
+		mask.Set(page);
+		m_page_manager.UpdatePageWatchersForRegion<false, true>(m_cpu_addr, mask);
+		return true;
+	}
+
+	// Marks the pages of [vaddr, vaddr + size) that the GPU does not own as CPU-modified,
+	// releasing their write watch.
+	void MarkCpuModifiedUnlessGpu(uint64_t vaddr, uint64_t size) {
+		const auto [start, end] = GetPageRange(vaddr, size);
+		for (auto page = start; page < end; page++) {
+			if (!m_gpu_dirty.Get(page)) {
+				m_cpu_dirty.Set(page);
+			}
+		}
+		UpdateProtection<false, false>();
+	}
+
 	TrackingSpinLock lock;
 
 private:
+	// `track` is the direction the caller's state change moves pages in; pages released early
+	// (AllowReadIfUnchanged) can move the other way, so both directions are applied.
 	template <bool track, bool is_read>
 	void UpdateProtection() {
 		const auto protection = is_read ? ~m_gpu_dirty : m_cpu_dirty;
 		auto&      previous   = is_read ? m_readable : m_writable;
-		auto       mask       = protection ^ previous;
+		const auto mask       = protection ^ previous;
 		if (mask.None()) {
 			return;
 		}
 		previous = protection;
 		PERFTMP_SCOPE("UpdatePageWatchersForRegion"); // PERFTMP
-		m_page_manager.UpdatePageWatchersForRegion<track, is_read>(m_cpu_addr, mask);
+		auto primary   = mask & (track ? ~protection : protection);
+		auto secondary = mask & (track ? protection : ~protection);
+		if (primary.Any()) {
+			m_page_manager.UpdatePageWatchersForRegion<track, is_read>(m_cpu_addr, primary);
+		}
+		if (secondary.Any()) {
+			m_page_manager.UpdatePageWatchersForRegion<!track, is_read>(m_cpu_addr, secondary);
+		}
 	}
 
 	template <DirtySource source>
@@ -181,12 +229,13 @@ private:
 		        static_cast<size_t>((offset + size + TRACKER_PAGE_SIZE - 1) / TRACKER_PAGE_SIZE)};
 	}
 
-	PageManager& m_page_manager;
-	uint64_t     m_cpu_addr = 0;
-	RegionBits   m_cpu_dirty;
-	RegionBits   m_gpu_dirty;
-	RegionBits   m_writable;
-	RegionBits   m_readable;
+	PageManager&                               m_page_manager;
+	uint64_t                                   m_cpu_addr = 0;
+	RegionBits                                 m_cpu_dirty;
+	RegionBits                                 m_gpu_dirty;
+	RegionBits                                 m_writable;
+	RegionBits                                 m_readable;
+	std::array<uint32_t, TRACKER_REGION_PAGES> m_gpu_generation {};
 };
 
 } // namespace Libs::Graphics

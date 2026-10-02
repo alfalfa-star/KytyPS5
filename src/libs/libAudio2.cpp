@@ -331,6 +331,31 @@ static void audioout2_update_context_locked(AudioOut2ContextState* state) {
 	}
 }
 
+// A blocking push returns once the context can take another grain. Wwise's sink wakes its
+// renderer right after each push and renders only as many frames as GetQueueLevel reports free;
+// returning with the queue still full leaves it nothing to render and the output loop stalls.
+static void audioout2_wait_for_free_queue(AudioOut2ContextHandle ctx) {
+	for (;;) {
+		uint64_t wait_micros = 0;
+		g_audioout2_context_mutex.Lock();
+		if (auto* state = audioout2_find_context_locked(ctx); state != nullptr) {
+			audioout2_update_context_locked(state);
+			if (state->queued >= state->queue_depth) {
+				const auto grain_micros =
+				    static_cast<uint64_t>(audioout2_grain_micros(state->num_grains));
+				const auto now  = LibKernel::KernelGetProcessTime();
+				const auto next = state->last_update + grain_micros;
+				wait_micros     = (next > now ? next - now : 1);
+			}
+		}
+		g_audioout2_context_mutex.Unlock();
+		if (wait_micros == 0) {
+			return;
+		}
+		Common::Thread::SleepMicro(static_cast<uint32_t>(wait_micros));
+	}
+}
+
 static AudioOut2PortStateEntry* audioout2_find_port_locked(AudioOut2PortHandle port) {
 	for (auto& state: g_audioout2_ports) {
 		if (state.used && state.handle == port) {
@@ -512,8 +537,7 @@ int KYTY_SYSV_ABI AudioOut2ContextPush(AudioOut2ContextHandle ctx, uint32_t bloc
 		// Only a synchronous submission carrying PCM to a real device can rely on the SDL queue for
 		// pacing. Async pushes must retain queue-depth backpressure, and a handle without PCM (or a
 		// vibration/failed-open handle) has no downstream operation that can block this call.
-		const bool use_device_clock =
-		    blocking != 0 && audioout2_context_has_queueable_device(ctx);
+		const bool use_device_clock = blocking != 0 && audioout2_context_has_queueable_device(ctx);
 
 		g_audioout2_context_mutex.Lock();
 		if (auto* state = audioout2_find_context_locked(ctx); state != nullptr) {
@@ -528,6 +552,9 @@ int KYTY_SYSV_ABI AudioOut2ContextPush(AudioOut2ContextHandle ctx, uint32_t bloc
 				}
 				g_audioout2_context_mutex.Unlock();
 				audioout2_queue_context_audio(ctx, blocking != 0);
+				if (blocking != 0) {
+					audioout2_wait_for_free_queue(ctx);
+				}
 				return OK;
 			}
 		}

@@ -28,7 +28,14 @@ public:
 	void               MarkRegionAsCpuModified(uint64_t vaddr, uint64_t size);
 	void               MarkRegionAsGpuModified(uint64_t vaddr, uint64_t size);
 	void               UnmarkRegionAsGpuModified(uint64_t vaddr, uint64_t size);
-	void               UntrackMemory(uint64_t vaddr, uint64_t size);
+	// How often the page was marked GPU-modified. Pass it to AllowReadIfUnchanged later.
+	[[nodiscard]] uint32_t GpuGeneration(uint64_t page);
+	// Lets the CPU read a GPU-modified page whose data guest memory already holds (a completed
+	// download), unless it was marked again since `generation`. Safe from any thread.
+	bool AllowReadIfUnchanged(uint64_t page, uint32_t generation);
+	// Marks the pages of the range the GPU does not own as CPU-modified (no flush).
+	void MarkCpuModifiedUnlessGpu(uint64_t vaddr, uint64_t size);
+	void UntrackMemory(uint64_t vaddr, uint64_t size);
 	// Removes protection from a range and flushes GPU-owned data when required.
 	template <typename Flush>
 	void InvalidateRegion(uint64_t vaddr, uint64_t size, Flush&& on_flush) noexcept {
@@ -106,6 +113,7 @@ public:
 
 private:
 	static constexpr size_t REGION_COUNT = TRACKER_ADDRESS_SIZE / TRACKER_REGION_SIZE;
+
 	inline static thread_local const MemoryTracker* s_upload_owner = nullptr;
 
 	void CheckNotInUploadCallback() const noexcept {

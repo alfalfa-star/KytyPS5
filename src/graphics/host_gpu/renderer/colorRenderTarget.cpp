@@ -17,6 +17,9 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cstdio>
+#include <mutex>
+#include <set>
 
 namespace Libs::Graphics {
 
@@ -183,6 +186,26 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 			    (unsigned long long)rt.base.addr, width, height, (unsigned)rt.attrib3.tile_mode,
 			    (int)rt.info.dcc_compression_enable, (int)rt.info.cmask_fast_clear_enable,
 			    (unsigned long long)rt.dcc_addr.addr);
+		}
+	}
+	{ // PERFTMP: one line per distinct render-target shape with its metadata state
+		static std::mutex                        seen_mutex;
+		static std::set<std::array<uint64_t, 3>> seen;
+		const std::array<uint64_t, 3> key {rt.base.addr, (uint64_t {width} << 32u) | height,
+		                                   (static_cast<uint64_t>(rt.info.format) << 8u) |
+		                                       static_cast<uint64_t>(rt.info.channel_type)};
+		std::scoped_lock              lock {seen_mutex};
+		if (seen.size() < 4000 && seen.insert(key).second) {
+			std::fprintf(stderr,
+			             "PERFTMP rtshape addr=%010llx %ux%u fmt=%u type=%u order=%u vk=%s tile=%u "
+			             "cmask_fc=%d cmask=%llx dcc=%d dccaddr=%llx fmask=%llx samples=%u\n",
+			             (unsigned long long)rt.base.addr, width, height, (unsigned)rt.info.format,
+			             (unsigned)rt.info.channel_type, (unsigned)rt.info.channel_order,
+			             vk::to_string(target_format.format).c_str(),
+			             (unsigned)rt.attrib3.tile_mode, (int)rt.info.cmask_fast_clear_enable,
+			             (unsigned long long)rt.cmask.addr, (int)rt.info.dcc_compression_enable,
+			             (unsigned long long)rt.dcc_addr.addr, (unsigned long long)rt.fmask.addr,
+			             samples);
 		}
 	}
 	if (bytes_per_element == 0) {

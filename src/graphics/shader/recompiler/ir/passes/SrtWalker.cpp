@@ -398,7 +398,11 @@ private:
 		if (inst == nullptr) {
 			Fail(use_pc, "invalid typed planning value");
 		}
-		const auto cycle = std::ranges::find(m_visiting, inst);
+		if (m_visited.contains(inst)) {
+			return;
+		}
+		const auto cycle =
+		    m_visiting_set.contains(inst) ? std::ranges::find(m_visiting, inst) : m_visiting.end();
 		if (cycle != m_visiting.end()) {
 			const auto contains_phi = std::any_of(cycle, m_visiting.end(), [](const Inst* value) {
 				return value->GetOpcode() == ValueOpcode::Phi;
@@ -409,15 +413,14 @@ private:
 			Fail(use_pc, fmt::format("cyclic typed planning value {} without a phi",
 			                         ValueOpcodeName(inst->GetOpcode())));
 		}
-		if (std::ranges::find(m_visited, inst) != m_visited.end()) {
-			return;
-		}
 		m_visiting.push_back(inst);
+		m_visiting_set.insert(inst);
 		for (size_t index = 0; index < inst->NumArgs(); index++) {
 			Collect(inst->Arg(index), use_pc);
 		}
 		m_visiting.pop_back();
-		m_visited.push_back(inst);
+		m_visiting_set.erase(inst);
+		m_visited.insert(inst);
 		if (!IsRawRead(m_program, *inst)) {
 			return;
 		}
@@ -434,23 +437,34 @@ private:
 		if (DependsOnDynamicRead(inst->Arg(0), 0) && !ValidateRuntimeValue(m_program, value)) {
 			return;
 		}
-		for (uint32_t slot = 0; slot < m_program.srt_reads.size(); slot++) {
+		// Equivalent reads share the opcode and the immediate offset; only compare those.
+		auto& candidates =
+		    m_slots_by_offset[(static_cast<uint64_t>(inst->GetOpcode()) << 32u) | offset.U32()];
+		for (const auto slot: candidates) {
 			if (EquivalentValue(m_program, value, m_program.srt_reads[slot].value)) {
 				m_patches.push_back({inst, slot, false});
 				return;
 			}
 		}
 		const auto slot = static_cast<uint32_t>(m_program.srt_reads.size());
+		candidates.push_back(slot);
 		m_program.srt_reads.push_back({value, slot});
 		m_patches.push_back({inst, slot, true});
 	}
 
 	void PatchReads() {
+		std::unordered_map<const Inst*, Block::iterator> positions;
 		for (const auto& patch: m_patches) {
-			auto* block = patch.inst->Parent();
-			auto& list  = block->Instructions();
-			auto  where =
-			    std::ranges::find_if(list, [&](const Inst& inst) { return &inst == patch.inst; });
+			auto& list = patch.inst->Parent()->Instructions();
+			if (!positions.contains(patch.inst)) {
+				for (auto it = list.begin(); it != list.end(); ++it) {
+					positions.emplace(&*it, it);
+				}
+			}
+		}
+		for (const auto& patch: m_patches) {
+			auto*      block = patch.inst->Parent();
+			auto       where = positions.at(patch.inst);
 			const auto resource =
 			    Value(&*block->PrependNewInst(where, ValueOpcode::GetSrtResource));
 			const auto flat = Value(&*block->PrependNewInst(where, ValueOpcode::ReadConst,
@@ -477,10 +491,12 @@ private:
 		}
 	}
 
-	Program&           m_program;
-	std::vector<Inst*> m_visiting;
-	std::vector<Inst*> m_visited;
-	std::vector<Patch> m_patches;
+	Program&                                            m_program;
+	std::vector<Inst*>                                  m_visiting;
+	std::unordered_set<const Inst*>                     m_visiting_set;
+	std::unordered_set<const Inst*>                     m_visited;
+	std::vector<Patch>                                  m_patches;
+	std::unordered_map<uint64_t, std::vector<uint32_t>> m_slots_by_offset;
 };
 
 class Evaluator {

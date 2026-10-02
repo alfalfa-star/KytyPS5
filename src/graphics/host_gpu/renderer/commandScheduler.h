@@ -7,6 +7,7 @@
 #include "graphics/host_gpu/renderer/render.h"
 
 #include <condition_variable>
+#include <deque>
 #include <functional>
 #include <mutex>
 
@@ -40,13 +41,16 @@ public:
 	void SetPreSubmitHook(std::function<void()> hook) { m_pre_submit = std::move(hook); }
 	// Deferred callbacks can observe an externally owned drain, but cannot initiate shutdown:
 	// the priority runner cannot join itself.
-	void                      Shutdown();
-	void                      Wait(uint64_t tick);
-	void                      PopPendingOperations();
-	void                      DrainPriorityOperations();
-	void                      WaitPriorityOperations(uint64_t tick);
-	void                      DeferOperation(Common::UniqueFunction<void>&& operation);
-	void                      DeferPriorityOperation(Common::UniqueFunction<void>&& operation);
+	void Shutdown();
+	void Wait(uint64_t tick);
+	void PopPendingOperations();
+	void DrainPriorityOperations();
+	void WaitPriorityOperations(uint64_t tick);
+	void DeferOperation(Common::UniqueFunction<void>&& operation);
+	// ahead_of_tick: run before the operations already deferred for the current tick, e.g. a
+	// download publishing data the tick's label writes announce to the guest.
+	void                      DeferPriorityOperation(Common::UniqueFunction<void>&& operation,
+	                                                 bool                           ahead_of_tick = false);
 	[[nodiscard]] static bool InDeferredOperation() noexcept;
 
 	[[nodiscard]] bool     Active() const noexcept { return m_command.m_registers != nullptr; }
@@ -84,7 +88,8 @@ private:
 
 	struct PendingOperation {
 		Common::UniqueFunction<void> callback;
-		uint64_t                     tick = 0;
+		uint64_t                     tick  = 0;
+		bool                         ahead = false; // queued with ahead_of_tick
 	};
 
 	void BeginNext();
@@ -97,7 +102,7 @@ private:
 	CommandPool                  m_command_pool;
 	CommandBuffer                m_command;
 	std::queue<PendingOperation> m_pending_operations;
-	std::queue<PendingOperation> m_priority_operations;
+	std::deque<PendingOperation> m_priority_operations;
 	std::mutex                   m_operation_mutex;
 	std::condition_variable      m_operation_available;
 	std::jthread                 m_priority_thread;

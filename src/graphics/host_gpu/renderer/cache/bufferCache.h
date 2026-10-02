@@ -64,6 +64,9 @@ public:
 	// Cache-index and exact dirty-range queries require GPU-thread serialization.
 	[[nodiscard]] bool IsRegionRegistered(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool HasGpuDirtyBytes(uint64_t vaddr, uint64_t size);
+	// After a CPU write fault: releases the write watch of the surrounding window too (pages the
+	// GPU owns excepted), so a writer streaming through memory faults once per window.
+	void               ReleaseWriteWindow(uint64_t fault_vaddr);
 	[[nodiscard]] bool IsRegionCpuModified(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
 	void               ProcessFaultBuffer();
@@ -104,10 +107,19 @@ private:
 	[[nodiscard]] vk::Buffer UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> copies,
 	                                      uint64_t total_size);
 	[[nodiscard]] bool SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uint64_t size);
+	// A page whose read protection the download lifts as soon as its data is published, unless
+	// the GPU wrote it again since `generation` (MemoryTracker::GpuGeneration).
+	struct PageRelease {
+		uint64_t page       = 0;
+		uint32_t generation = 0;
+	};
 	// Queues backing publication; callers wait before clearing dirty pages or reusing their data.
 	// keep_dirty leaves the range GPU-dirty; the caller clears it once the download completed.
+	// A prefetch (release != nullptr) never waits for staging space: it runs from the
+	// pre-submit hook, where a wait would submit again. It returns false when there is no room.
 	[[nodiscard]] bool DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size,
-	                                        bool keep_dirty = false);
+	                                        bool               keep_dirty = false,
+	                                        const PageRelease* release    = nullptr);
 
 	// Pages the CPU keeps reading back after the GPU writes them (query results, counters,
 	// records next to CPU data). Each readback of such a page otherwise submits the recording

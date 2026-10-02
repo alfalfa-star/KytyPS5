@@ -5,9 +5,15 @@
 #include "common/perfTmp.h" // PERFTMP
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/presentation/videoOut.h"
+#include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "libs/errno.h"
 
 #include <algorithm>
+#include <chrono>        // PERFTMP
+#include <cstdio>        // PERFTMP
+#include <mutex>         // PERFTMP
+#include <unordered_map> // PERFTMP
+#include <vector>        // PERFTMP
 
 namespace Libs::Graphics {
 
@@ -24,6 +30,7 @@ RenderContext::RenderContext(GraphicContext& graphics)
 RenderContext::~RenderContext() {
 	ShutdownGpu();
 	m_command_scheduler.Shutdown();
+	ReleaseDescriptorTableWatches(0, UINT64_MAX);
 }
 
 void RenderContext::InitializeGpu(VideoOut::VideoOutDriver* video_out) {
@@ -60,25 +67,41 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 	// The host reports the faulting byte, not the instruction's access width. Both caches
 	// resolve its page; guessing a width can cross the end of a valid guest mapping.
 	constexpr uint64_t fault_size = 1;
+	bool               released   = false;
+	if (access == PageFaultAccess::Write) {
+		const auto      page = fault_vaddr & ~(TRACKER_PAGE_SIZE - 1u);
+		std::lock_guard lock(m_table_watch_mutex);
+		if (m_table_watch_pages.erase(page) != 0) {
+			m_page_manager.UpdatePageWatchers<false>(page, TRACKER_PAGE_SIZE);
+			released = true;
+		}
+	}
+	if (released) {
+		ShaderRecompiler::IR::InvalidateDescriptorTableCache(
+		    fault_vaddr & ~(TRACKER_PAGE_SIZE - 1u), TRACKER_PAGE_SIZE);
+	}
 	if (!IsMapped(fault_vaddr, fault_size)) {
-		return false;
+		return released;
 	}
 	if (access == PageFaultAccess::Write) {
 		PERFTMP_SCOPE("write fault invalidate"); // PERFTMP
 		{
 			PERFTMP_SCOPE("write fault: buffer invalidate"); // PERFTMP
 			m_buffer_cache.InvalidateMemory(fault_vaddr, fault_size);
+			m_buffer_cache.ReleaseWriteWindow(fault_vaddr);
 		}
 		PERFTMP_SCOPE("write fault: texture invalidate"); // PERFTMP
 		m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);
 	} else {
 		PERFTMP_SCOPE("ReadMemory from read fault"); // PERFTMP
+		PerfTmp::RecordReadFault(fault_vaddr);       // PERFTMP
 		m_buffer_cache.ReadMemory(fault_vaddr, fault_size);
 	}
 	return true;
 }
 
 bool RenderContext::InvalidateMemory(uint64_t vaddr, uint64_t size) {
+	ShaderRecompiler::IR::InvalidateDescriptorTableCache(vaddr, size);
 	if (!IsMapped(vaddr, size)) {
 		return false;
 	}
@@ -95,6 +118,44 @@ bool RenderContext::IsMapped(uint64_t vaddr, uint64_t size) const noexcept {
 	return m_mapped_ranges.Contains(vaddr, size);
 }
 
+bool RenderContext::WatchDescriptorTableMemory(uint64_t vaddr, uint64_t size) {
+	if (size == 0 || !IsMapped(vaddr, size)) {
+		return false;
+	}
+	const auto      begin = vaddr & ~(TRACKER_PAGE_SIZE - 1u);
+	const auto      end   = (vaddr + size + TRACKER_PAGE_SIZE - 1u) & ~(TRACKER_PAGE_SIZE - 1u);
+	std::lock_guard lock(m_table_watch_mutex);
+	// Watch runs of new pages with one protection change each.
+	uint64_t run_begin = 0;
+	uint64_t run_end   = 0;
+	for (auto page = begin; page < end; page += TRACKER_PAGE_SIZE) {
+		if (!m_table_watch_pages.insert(page).second) {
+			continue;
+		}
+		if (run_end != page) {
+			if (run_end != run_begin) {
+				m_page_manager.UpdatePageWatchers<true>(run_begin, run_end - run_begin);
+			}
+			run_begin = page;
+		}
+		run_end = page + TRACKER_PAGE_SIZE;
+	}
+	if (run_end != run_begin) {
+		m_page_manager.UpdatePageWatchers<true>(run_begin, run_end - run_begin);
+	}
+	return true;
+}
+
+void RenderContext::ReleaseDescriptorTableWatches(uint64_t vaddr, uint64_t size) {
+	const auto      end = size > UINT64_MAX - vaddr ? UINT64_MAX : vaddr + size;
+	std::lock_guard lock(m_table_watch_mutex);
+	for (auto it = m_table_watch_pages.lower_bound(vaddr & ~(TRACKER_PAGE_SIZE - 1u));
+	     it != m_table_watch_pages.end() && *it < end;) {
+		m_page_manager.UpdatePageWatchers<false>(*it, TRACKER_PAGE_SIZE);
+		it = m_table_watch_pages.erase(it);
+	}
+}
+
 void RenderContext::MapMemory(uint64_t vaddr, uint64_t size) {
 	std::lock_guard lock(m_mapped_ranges_mutex);
 	m_mapped_ranges.Add(vaddr, size);
@@ -107,6 +168,8 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		     vaddr, size);
 	}
 	const auto unmap = [this, vaddr, size] {
+		ShaderRecompiler::IR::InvalidateDescriptorTableCache();
+		ReleaseDescriptorTableWatches(vaddr, size);
 		if (m_command_scheduler.Active()) {
 			const auto tick = m_command_scheduler.CurrentTick();
 			m_command_scheduler.Finish();

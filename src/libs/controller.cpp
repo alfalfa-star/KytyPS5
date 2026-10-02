@@ -5,6 +5,7 @@
 #include "common/common.h"
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
+#include "common/perfTmp.h" // PERFTMP
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "kernel/pthread.h"
@@ -164,6 +165,13 @@ static uint32_t AutoPressTmp() { // PERFTMP
 		const char* e = std::getenv("KYTY_AUTOPRESS_PERIOD_MS");
 		return e != nullptr ? std::atof(e) / 1000.0 : 0.0;
 	}();
+	static const uint32_t until_flip = [] { // KYTY_AUTOPRESS_UNTIL_FLIP=N: stop pressing at flip N
+		const char* e = std::getenv("KYTY_AUTOPRESS_UNTIL_FLIP");
+		return e != nullptr ? static_cast<uint32_t>(std::atoi(e)) : UINT32_MAX;
+	}();
+	if (PerfTmp::FlipCounter().load() >= until_flip) {
+		return 0;
+	}
 	if (period > 0.0 && std::fmod(t, period) < period / 2.0) {
 		return PAD_BUTTON_CROSS;
 	}
@@ -171,6 +179,50 @@ static uint32_t AutoPressTmp() { // PERFTMP
 		if (t >= s && t < s + 0.3) return PAD_BUTTON_CROSS;
 	}
 	return 0;
+}
+
+// PERFTMP: KYTY_AUTOTOUCH_PERIOD_MS=N drags one finger across the touch pad during the first
+// 70% of every N ms, cycling right, down, left, up (and a vertical zigzag); starts after
+// KYTY_AUTOTOUCH_START_S seconds.
+static bool AutoTouchTmp(PadTouch& touch) { // PERFTMP
+	static const double period = [] {
+		const char* e = std::getenv("KYTY_AUTOTOUCH_PERIOD_MS");
+		return e != nullptr ? std::atof(e) / 1000.0 : 0.0;
+	}();
+	static const double start_s = [] {
+		const char* e = std::getenv("KYTY_AUTOTOUCH_START_S");
+		return e != nullptr ? std::atof(e) : 0.0;
+	}();
+	if (period <= 0.0) {
+		return false;
+	}
+	static const auto start = std::chrono::steady_clock::now();
+	const double      t =
+	    std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count() - start_s;
+	if (t < 0.0) {
+		return false;
+	}
+	const auto   stroke = static_cast<uint64_t>(t / period);
+	const double phase  = std::fmod(t, period) / (period * 0.7);
+	if (phase >= 1.0) {
+		return false;
+	}
+	double x = 0.5;
+	double y = 0.5;
+	switch (stroke % 5) {
+		case 0: x = 0.15 + 0.7 * phase; break;
+		case 1: y = 0.1 + 0.8 * phase; break;
+		case 2: x = 0.85 - 0.7 * phase; break;
+		case 3: y = 0.9 - 0.8 * phase; break;
+		default:
+			x = 0.3 + 0.4 * std::fabs(std::fmod(phase * 4.0, 2.0) - 1.0);
+			y = 0.1 + 0.8 * phase;
+			break;
+	}
+	touch.x  = static_cast<uint16_t>(x * 1919.0);
+	touch.y  = static_cast<uint16_t>(y * 942.0);
+	touch.id = static_cast<uint8_t>(1u + stroke % 127u);
+	return true;
 }
 
 static void pad_fill_data(PadData* data, const ControllerState& state, bool connected,
@@ -203,6 +255,9 @@ static void pad_fill_data(PadData* data, const ControllerState& state, bool conn
 			output.y     = touch.y;
 			output.id    = touch.id;
 		}
+	}
+	if (data->touch_data.touch_num == 0 && AutoTouchTmp(data->touch_data.touch[0])) { // PERFTMP
+		data->touch_data.touch_num = 1;
 	}
 	data->connected              = connected;
 	data->timestamp              = state.time;

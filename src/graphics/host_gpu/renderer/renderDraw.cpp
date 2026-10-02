@@ -40,6 +40,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fmt/format.h>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -920,6 +921,11 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
                                             DrawRenderState& state) {
 	state.ps_active = DrawHasActivePixelShader(buffer);
 	RefreshShaders(buffer, draw, state);
+	const bool perftmp_bindless_ps = state.ps_active && state.ps_input_info.stage && // PERFTMP
+	                                 state.ps_input_info.stage.program->info.uses_bindless;
+	if (perftmp_bindless_ps) {                     // PERFTMP
+		PERFTMP_SCOPE("bindless draw: refreshed"); // PERFTMP
+	} // PERFTMP
 	uint32_t mrt_mask = 0;
 	if (state.ps_active) {
 		for (const auto& output: state.ps_input_info.stage.program->info.outputs) {
@@ -948,6 +954,9 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 	if (state.color_count == 0 && !state.depth_info.image_id && !state.ps_active) {
 		LogFramebufferSkip(draw.Name(), state.color_info[0], state.depth_info, buffer,
 		                   draw.index_count, 0);
+		if (perftmp_bindless_ps) {
+			PERFTMP_SCOPE("bindless draw: fb skip");
+		} // PERFTMP
 		return false;
 	}
 
@@ -1109,6 +1118,9 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		                                            static_cast<uint64_t>(draw.index_count) *
 		                                                index_source.guest_element_size);
 	}
+	if (state.ps_active && state.ps_input_info.stage.program->info.uses_bindless) { // PERFTMP
+		PERFTMP_SCOPE("bindless draw: execute");                                    // PERFTMP
+	} // PERFTMP
 	LogDrawPhase(draw.Name(), "PrepareBindings");
 	GraphicsBindings                 bindings;
 	std::array<PreparedBindings*, 4> descriptor_stages {};
@@ -1160,6 +1172,35 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		if (skip != 0 && bindings.pixel && bindings.pixel->runtime->program->shader_hash == skip) {
 			return;
 		}
+		// KYTY_SKIP_SWEEP=<flip>: collect pixel shaders for 10 flips, then skip each for 6 flips.
+		static const uint32_t sweep = [] {
+			const char* v = std::getenv("KYTY_SKIP_SWEEP");
+			return v != nullptr ? static_cast<uint32_t>(std::atoi(v)) : 0u;
+		}();
+		if (sweep != 0 && bindings.pixel) {
+			static std::vector<uint64_t> hashes;
+			static uint32_t              announced = UINT32_MAX;
+			const auto                   flip      = PerfTmp::FlipCounter().load();
+			const auto                   hash      = bindings.pixel->runtime->program->shader_hash;
+			if (flip >= sweep && flip < sweep + 10u) {
+				if (std::ranges::find(hashes, hash) == hashes.end()) {
+					hashes.push_back(hash);
+				}
+			} else if (flip >= sweep + 10u) {
+				const auto index = (flip - sweep - 10u) / 6u;
+				if (index < hashes.size()) {
+					if (announced != index) {
+						announced = index;
+						std::fprintf(stderr, "SWEEP index=%u flip=%u skip=%016llx of %zu\n", index,
+						             flip, static_cast<unsigned long long>(hashes[index]),
+						             hashes.size());
+					}
+					if (hash == hashes[index]) {
+						return;
+					}
+				}
+			}
+		}
 		if (PerfTmp::TraceFrame() && bindings.pixel &&
 		    (bindings.pixel->runtime->program->shader_hash & 0xffffffffull) == 0x1563e824ull) {
 			const auto& regs = buffer.GetRegisters();
@@ -1182,6 +1223,18 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 			             static_cast<unsigned long long>(info.data.address),
 			             static_cast<unsigned>(info.guest_format), info.extent.width,
 			             info.extent.height);
+		}
+		const auto ps_hash = bindings.pixel ? bindings.pixel->runtime->program->shader_hash : 0;
+		if (ps_hash != 0 && PerfTmp::DumpShader(ps_hash)) {
+			const int   seq = PerfTmp::NextDumpSeq();
+			const char* dir = std::getenv("KYTY_DUMP_DIR");
+			for (uint32_t i = 0; seq >= 0 && i < state.color_count; i++) {
+				const auto path =
+				    fmt::format("{}/f{}_{:04}_{:016x}_rt{}_{:010x}", dir != nullptr ? dir : ".",
+				                PerfTmp::FlipCounter().load(), seq, ps_hash, i,
+				                state.color_info[i].desc.info.data.address);
+				m_context.GetTextureCache().DebugDumpImage(state.color_info[i].image_id, path);
+			}
 		}
 	}
 	CommitBindings(buffer, vk::PipelineBindPoint::eGraphics, pipeline, stages);

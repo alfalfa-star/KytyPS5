@@ -27,7 +27,7 @@ namespace {
 }
 
 [[nodiscard]] vk::ImageCreateFlags ImageCreateFlags(const GraphicContext& graphics,
-                                                   const ImageInfo& info) {
+                                                    const ImageInfo&      info) {
 	vk::ImageCreateFlags flags {};
 	if (DepthAspectTransferFormat(info.pixel_format) == vk::Format::eUndefined) {
 		flags |= vk::ImageCreateFlagBits::eMutableFormat;
@@ -59,7 +59,8 @@ namespace {
 	}
 	if (DepthAspectTransferFormat(info.pixel_format) != vk::Format::eUndefined) {
 		usage |= vk::ImageUsageFlagBits::eDepthStencilAttachment;
-		if (graphics.attachment_feedback_loop_enabled && (usage & vk::ImageUsageFlagBits::eSampled)) {
+		if (graphics.attachment_feedback_loop_enabled &&
+		    (usage & vk::ImageUsageFlagBits::eSampled)) {
 			usage |= vk::ImageUsageFlagBits::eAttachmentFeedbackLoopEXT;
 		}
 		return usage;
@@ -674,6 +675,13 @@ Image::Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageI
 	create.samples       = vulkan_sample_count(info.samples);
 
 	vk::ImageFormatProperties properties {};
+	// RADV rejects block-texel views on 3D images with 128-bit blocks (BC2/3/5/6H/7).
+	if ((create.flags & vk::ImageCreateFlagBits::eBlockTexelViewCompatible) &&
+	    graphics.GetImageFormatProperties(create.format, create.imageType, create.tiling,
+	                                      create.usage, create.flags,
+	                                      &properties) != vk::Result::eSuccess) {
+		create.flags &= ~vk::ImageCreateFlagBits::eBlockTexelViewCompatible;
+	}
 	if (graphics.GetImageFormatProperties(create.format, create.imageType, create.tiling,
 	                                      create.usage, create.flags,
 	                                      &properties) != vk::Result::eSuccess ||
@@ -695,7 +703,7 @@ Image::Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageI
 uint64_t Image::HashGuestEdges() const {
 	std::array<uint8_t, TRACKER_PAGE_SIZE * 2> bytes {};
 	const auto                                 range = info.data;
-	const uint64_t head_end =
+	const uint64_t                             head_end =
 	    std::min(range.End(), Common::AlignUp(range.address, TRACKER_PAGE_SIZE));
 	const uint64_t tail_begin =
 	    std::max(range.address, Common::AlignDown(range.End(), TRACKER_PAGE_SIZE));

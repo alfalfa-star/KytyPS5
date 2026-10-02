@@ -48,7 +48,7 @@ public:
 	[[nodiscard]] bool               IsCoherent() const noexcept { return m_coherent; }
 	[[nodiscard]] MemoryUsage        Usage() const noexcept { return m_usage; }
 	[[nodiscard]] uint64_t           CpuAddress() const noexcept { return m_cpu_address; }
-	[[nodiscard]] vk::DeviceAddress BufferDeviceAddress() const noexcept;
+	[[nodiscard]] vk::DeviceAddress  BufferDeviceAddress() const noexcept;
 	[[nodiscard]] uint64_t           Offset(uint64_t address) const noexcept {
 		return address - m_cpu_address;
 	}
@@ -82,16 +82,16 @@ private:
 	                                              vk::AccessFlags source,
 	                                              vk::AccessFlags destination) const;
 
-	GraphicContext*               m_graphics    = nullptr;
-	CommandScheduler*             m_scheduler   = nullptr;
-	MemoryUsage                   m_usage       = MemoryUsage::DeviceLocal;
-	uint64_t                      m_cpu_address = 0;
-	vk::DeviceAddress             m_device_address = 0;
-	vk::Buffer                    m_buffer     = nullptr;
-	VmaAllocation                 m_allocation = nullptr;
-	uint64_t                      m_size;
-	bool                          m_coherent = false;
-	std::span<uint8_t>            m_mapped;
+	GraphicContext*    m_graphics       = nullptr;
+	CommandScheduler*  m_scheduler      = nullptr;
+	MemoryUsage        m_usage          = MemoryUsage::DeviceLocal;
+	uint64_t           m_cpu_address    = 0;
+	vk::DeviceAddress  m_device_address = 0;
+	vk::Buffer         m_buffer         = nullptr;
+	VmaAllocation      m_allocation     = nullptr;
+	uint64_t           m_size;
+	bool               m_coherent = false;
+	std::span<uint8_t> m_mapped;
 };
 
 class StreamBuffer final: public Buffer {
@@ -99,8 +99,20 @@ public:
 	StreamBuffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsage usage,
 	             uint64_t size);
 
+	enum class WaitPolicy {
+		Never,
+		Always,
+		// Wait for submitted work only: fail rather than submit the current recording (callers
+		// running inside a submit, such as its pre-submit hook).
+		SubmittedOnly,
+	};
+
 	[[nodiscard]] std::pair<uint8_t*, uint64_t> Map(uint64_t size, uint64_t alignment = 0,
-	                                                bool allow_wait = true);
+	                                                bool allow_wait = true) {
+		return Map(size, alignment, allow_wait ? WaitPolicy::Always : WaitPolicy::Never);
+	}
+	[[nodiscard]] std::pair<uint8_t*, uint64_t> Map(uint64_t size, uint64_t alignment,
+	                                                WaitPolicy policy);
 	void                                        Commit();
 	[[nodiscard]] uint64_t Copy(const void* source, uint64_t size, uint64_t alignment = 0);
 
@@ -114,10 +126,10 @@ private:
 
 	[[nodiscard]] static bool NormalizeReservation(bool coherent, uint64_t atom, uint64_t& size,
 	                                               uint64_t& alignment);
-	[[nodiscard]] bool        WaitPendingOperations(const std::vector<Watch>& watches,
-	                                                std::optional<size_t>     invalidation_mark,
-	                                                uint64_t requested_upper_bound, bool allow_wait,
-	                                                size_t& wait_cursor, uint64_t& wait_bound);
+	[[nodiscard]] bool WaitPendingOperations(const std::vector<Watch>& watches,
+	                                         std::optional<size_t>     invalidation_mark,
+	                                         uint64_t requested_upper_bound, WaitPolicy policy,
+	                                         size_t& wait_cursor, uint64_t& wait_bound);
 
 	uint64_t              m_offset      = 0;
 	uint64_t              m_mapped_size = 0;

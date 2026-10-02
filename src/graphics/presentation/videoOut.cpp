@@ -1478,6 +1478,7 @@ int VideoOutDriver::SubmitFlipFromGpu(Graphics::CommandBuffer& buffer, int handl
 	if ((PerfTmp::FlipCounter()++ % 50u) == 0u) { // PERFTMP
 		LOGF("PERFTMP flip %u\n", PerfTmp::FlipCounter().load());
 	}
+	PerfTmp::CheckTraceTrigger();       // PERFTMP
 	PERFTMP_SCOPE(__PRETTY_FUNCTION__); // PERFTMP
 	EXIT_IF(buffer.IsInvalid());
 

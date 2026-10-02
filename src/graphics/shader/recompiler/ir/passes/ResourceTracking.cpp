@@ -1,6 +1,7 @@
 #include "graphics/shader/recompiler/ir/passes/ResourceTracking.h"
 
 #include "common/assert.h"
+#include "common/perfTmp.h" // PERFTMP
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 
@@ -21,7 +22,10 @@ constexpr uint32_t SamplerBorderClampMask = (1u << 2u) | (1u << 5u) | (1u << 8u)
 // Entries a loop-counter key may select at most; the loop bound trims this when it is smaller.
 constexpr uint32_t MaxLoopTableKeys = 32u;
 // Upper bound on entries of a heap-size-bounded table; the host checks the actual V# size.
-constexpr uint32_t MaxHeapTableKeys          = 4096u;
+constexpr uint32_t MaxHeapTableKeys = 4096u;
+// Entries of a table bounded only by its heap V#: the key is not provably small, so this is just
+// an enumeration cap (Ghost of Yotei's material heap exceeds 4096 records).
+constexpr uint32_t MaxHeapBoundedKeys        = 16384u;
 constexpr uint32_t SamplerDword3ReservedMask = 0x3ffff000u;
 
 uint32_t PossibleU32Bits(Value value) {
@@ -107,14 +111,26 @@ public:
 		if (!m_program.srt_plan_complete) {
 			Fail(0, "SRT plan is not ready");
 		}
-		PlanIndirectTables();
-		LowerRuntimeBufferLoads();
-		for (auto* block: m_program.blocks) {
-			for (auto& inst: *block) {
-				Collect(inst);
+		{
+			PERFTMP_SCOPE("track: PlanIndirectTables");
+			PlanIndirectTables();
+		} // PERFTMP
+		{
+			PERFTMP_SCOPE("track: LowerRuntimeBufferLoads");
+			LowerRuntimeBufferLoads();
+		} // PERFTMP
+		{
+			PERFTMP_SCOPE("track: Collect"); // PERFTMP
+			for (auto* block: m_program.blocks) {
+				for (auto& inst: *block) {
+					Collect(inst);
+				}
 			}
 		}
-		LinkImageAliases();
+		{
+			PERFTMP_SCOPE("track: LinkImageAliases");
+			LinkImageAliases();
+		} // PERFTMP
 		for (const auto& patch: m_handle_patches) {
 			patch.handle->SetFlags<uint32_t>(patch.resource);
 		}
@@ -914,7 +930,21 @@ private:
 		return false;
 	}
 
+	static bool IsMemoryAccess(ValueOpcode op) {
+		return BufferAccessOf(op) != BufferAccess::None ||
+		       AddressOpcodeInfoOf(op).access != AddressAccess::None ||
+		       ImageOpcodeInfoOf(op).access != ImageAccess::None;
+	}
+
+	// Whether no memory access other than `owner` uses the metadata index.
 	bool MemoryIndexBelongsTo(uint32_t index, const Inst& owner) const {
+		if (m_memory_index_users != nullptr) {
+			const auto found = m_memory_index_users->find(index);
+			const auto users = found == m_memory_index_users->end() ? 0u : found->second;
+			const bool owner_counted =
+			    IsMemoryAccess(owner.GetOpcode()) && owner.Flags<MemoryFlags>().index == index;
+			return users == (owner_counted ? 1u : 0u);
+		}
 		for (const auto* block: m_program.blocks) {
 			for (const auto& inst: *block) {
 				const auto op = inst.GetOpcode();
@@ -1357,7 +1387,7 @@ private:
 			if (ScalarReadMemory(*material_read, memory_index) == nullptr) {
 				bounded      = true;
 				heap_bounded = true;
-				key_count    = MaxHeapTableKeys;
+				key_count    = MaxHeapBoundedKeys;
 			}
 		}
 		if (bounded) {
@@ -1535,6 +1565,22 @@ private:
 	}
 
 	void PlanIndirectTables() {
+		// Planning asks, per candidate dword, whether a read owns its memory index; count the
+		// users once instead of scanning the program for each question.
+		std::unordered_map<uint32_t, uint32_t> memory_index_users;
+		for (const auto* block: m_program.blocks) {
+			for (const auto& inst: *block) {
+				if (IsMemoryAccess(inst.GetOpcode())) {
+					memory_index_users[inst.Flags<MemoryFlags>().index]++;
+				}
+			}
+		}
+		m_memory_index_users = &memory_index_users;
+		struct Reset {
+			const std::unordered_map<uint32_t, uint32_t>*& users;
+			~Reset() { users = nullptr; }
+		} reset {m_memory_index_users};
+		std::unordered_set<const Inst*> not_tables;
 		for (auto* block: m_program.blocks) {
 			for (auto& inst: *block) {
 				const auto op = inst.GetOpcode();
@@ -1547,13 +1593,19 @@ private:
 				if (ImageOpcodeInfoOf(op).needs_sampler && inst.NumArgs() >= 2u) {
 					auto*             sampler = inst.Arg(1).Resolve().TryInstruction();
 					IndirectTablePlan sampler_plan;
-					if (sampler != nullptr && FindIndirectTable(*sampler) == nullptr &&
-					    TryMakeIndirectTable(*sampler, pc, sampler_plan)) {
-						m_indirect_tables.push_back(std::move(sampler_plan));
+					if (sampler != nullptr && !not_tables.contains(sampler) &&
+					    FindIndirectTable(*sampler) == nullptr) {
+						if (TryMakeIndirectTable(*sampler, pc, sampler_plan)) {
+							m_indirect_tables.push_back(std::move(sampler_plan));
+						} else {
+							not_tables.insert(sampler);
+						}
 					}
 				}
 				auto* handle = inst.Arg(0).Resolve().TryInstruction();
-				if (handle == nullptr || FindIndirectTable(*handle) != nullptr) {
+				// A handle shared by many accesses is analysed once.
+				if (handle == nullptr || not_tables.contains(handle) ||
+				    FindIndirectTable(*handle) != nullptr) {
 					continue;
 				}
 				// The emitter switches over the table's candidates only for these image
@@ -1569,6 +1621,8 @@ private:
 				IndirectTablePlan plan;
 				if (TryMakeIndirectTable(*handle, pc, plan)) {
 					m_indirect_tables.push_back(std::move(plan));
+				} else {
+					not_tables.insert(handle);
 				}
 			}
 		}
@@ -2162,12 +2216,14 @@ private:
 		}
 	}
 
-	Program&                                                         m_program;
-	ShaderInfo                                                       m_info;
-	std::vector<DescriptorSource>                                    m_sources;
-	std::vector<HandlePatch>                                         m_handle_patches;
-	std::vector<MemoryPatch>                                         m_memory_patches;
-	std::vector<IndirectTablePlan>                                   m_indirect_tables;
+	Program&                       m_program;
+	ShaderInfo                     m_info;
+	std::vector<DescriptorSource>  m_sources;
+	std::vector<HandlePatch>       m_handle_patches;
+	std::vector<MemoryPatch>       m_memory_patches;
+	std::vector<IndirectTablePlan> m_indirect_tables;
+	// Memory-access count per metadata index while PlanIndirectTables runs.
+	const std::unordered_map<uint32_t, uint32_t>*                    m_memory_index_users = nullptr;
 	std::unordered_map<const Inst*, Value>                           m_descriptor_selections;
 	std::unordered_map<const Block*, std::optional<SelectingBranch>> m_selecting_branches;
 	ShaderWriteOrder                                                 m_write_order;

@@ -3,10 +3,14 @@
 
 #include "common/common.h"
 #include "common/stringUtils.h"
+#include "graphics/shader/recompiler/frontend/cfg/ShaderCFG.h"
+#include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/shader.h"
 
+#include <memory>
 #include <span>
+#include <string>
 #include <vector>
 
 namespace Libs::Graphics::ShaderRecompiler {
@@ -38,6 +42,19 @@ struct CompileResult {
 	IR::Program           program;
 };
 
+// Decoded and structured control flow of a shader. It depends only on the code (and the stage
+// and back code of fused stages), so every permutation of a program can share it.
+struct PreparedProgram {
+	std::vector<uint32_t> code; // decoded.code points here
+	Decoder::Program      decoded;
+	CFG::Graph            cfg;
+	std::string           decoded_dump;
+};
+
+[[nodiscard]] std::shared_ptr<const PreparedProgram> PrepareProgram(std::span<const uint32_t> code,
+                                                                    const CompileOptions& options);
+[[nodiscard]] TranslateResult TranslateProgram(const PreparedProgram& prepared,
+                                               const CompileOptions&  options);
 [[nodiscard]] TranslateResult TranslateProgram(std::span<const uint32_t> code,
                                                const CompileOptions&     options);
 [[nodiscard]] CompileResult   CompileProgram(TranslateResult                   translated,

@@ -21,10 +21,13 @@
 #include <array>
 #include <bit>
 #include <cinttypes>
+#include <cstdio>
 #include <cstring>
+#include <fmt/format.h>
 #include <limits>
 #include <mutex>
 #include <span>
+#include <string>
 #include <tuple>
 #include <vulkan/vulkan_format_traits.hpp>
 
@@ -882,6 +885,14 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 	const int32_t requested_mip = requested.MipOf(cached.info);
 	if (requested_mip >= 0) {
 		const int32_t layer = requested.SliceOf(cached.info, requested_mip);
+		if (PerfTmp::TraceFrame()) { // PERFTMP
+			std::fprintf(
+			    stderr, "TRACE tc asmip requested %010llx %ux%u vk=%d is mip %d of %010llx %ux%u\n",
+			    (unsigned long long)requested.data.address, requested.extent.width,
+			    requested.extent.height, static_cast<int>(requested.pixel_format), requested_mip,
+			    (unsigned long long)cached.info.data.address, cached.info.extent.width,
+			    cached.info.extent.height);
+		}
 		return {cached_id, requested_mip, layer};
 	}
 
@@ -893,6 +904,11 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 		}
 		cached.binding.needs_rebind |= cached.binding.is_bound || cached.binding.is_target;
 		m_slot_images[merged_id].binding.is_target |= cached.binding.is_target;
+		if (PerfTmp::TraceFrame()) { // PERFTMP
+			std::fprintf(stderr, "TRACE tc mipmerge addr=%010llx %ux%u into mip %d layer %d\n",
+			             (unsigned long long)cached.info.data.address, cached.info.extent.width,
+			             cached.info.extent.height, mip, layer);
+		}
 		CopyImageMip(merged_id, cached_id, static_cast<uint32_t>(mip),
 		             static_cast<uint32_t>(layer));
 		FreeImage(cached_id);
@@ -905,6 +921,13 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 }
 
 ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId source_id) {
+	if (PerfTmp::TraceFrame()) { // PERFTMP
+		const auto& src = m_slot_images[source_id].info;
+		std::fprintf(stderr, "TRACE tc expand addr=%010llx %ux%u vk=%d -> %ux%u vk=%d\n",
+		             (unsigned long long)src.data.address, src.extent.width, src.extent.height,
+		             static_cast<int>(src.pixel_format), info.extent.width, info.extent.height,
+		             static_cast<int>(info.pixel_format));
+	}
 	RefreshCopySource(source_id);
 	const auto expanded_id = InsertImage(info);
 	auto&      expanded    = m_slot_images[expanded_id];
@@ -1187,6 +1210,32 @@ void TextureCache::MaterializeDccClear(ImageId id, const ImageDesc& desc,
 			EXIT("TextureCache: failed to read DCC metadata backing\n");
 		}
 		vk::ClearValue clear {};
+		if (PerfTmp::TraceFrame()) { // PERFTMP
+			std::vector<uint8_t> probe(slice_size);
+			(void)LibKernel::Memory::TryReadBacking(address, probe.data(), probe.size());
+			std::array<uint32_t, 256> histogram {};
+			for (const auto byte: probe) {
+				histogram[byte]++;
+			}
+			std::string top;
+			for (int n = 0; n < 4; n++) {
+				const auto it = std::max_element(histogram.begin(), histogram.end());
+				if (*it == 0) {
+					break;
+				}
+				top += fmt::format(" {:02x}:{}", it - histogram.begin(), *it);
+				*it = 0;
+			}
+			std::fprintf(stderr,
+			             "TRACE dcc image=%010llx %ux%u vk=%d type=%d meta=%010llx size=%llx "
+			             "first=%02x decodable=%d bytes%s clear_word=%08x\n",
+			             (unsigned long long)desc.info.data.address, desc.info.extent.width,
+			             desc.info.extent.height, static_cast<int>(desc.view_info.format),
+			             static_cast<int>(desc.type), (unsigned long long)address,
+			             (unsigned long long)slice_size, code,
+			             (int)DecodeDccClear(desc, code, clear.color), top.c_str(),
+			             desc.info.metadata.dcc_clear_word);
+		}
 		if (!DecodeDccClear(desc, code, clear.color)) {
 			continue;
 		}
@@ -1231,6 +1280,14 @@ void TextureCache::RefreshImage(ImageId id) {
 	}
 	if (!cpu_dirty) {
 		return;
+	}
+	if (PerfTmp::TraceFrame()) { // PERFTMP
+		std::fprintf(stderr,
+		             "TRACE tc upload addr=%010llx size=%llx %ux%u vk=%d buf_mod=%d cpu=%d\n",
+		             (unsigned long long)image.info.data.address,
+		             (unsigned long long)image.info.data.size, image.info.extent.width,
+		             image.info.extent.height, static_cast<int>(image.info.pixel_format),
+		             (int)image.IsBufferModified(), (int)image.IsDefinitelyCpuDirty());
 	}
 	InitializeImage(id);
 }
@@ -1801,6 +1858,62 @@ bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uin
 	return true;
 }
 
+void TextureCache::DebugDumpImage(ImageId id, const std::string& path) { // PERFTMP
+	auto& image = m_slot_images[id];
+	if (image.info.data.Empty() || image.info.IsDepth() || image.info.IsBlock() || image.depth_id ||
+	    image.backing.image == nullptr) {
+		std::fprintf(stderr, "DUMP skip %s\n", path.c_str());
+		return;
+	}
+	static StreamBuffer* dump = nullptr;
+	if (dump == nullptr) {
+		dump =
+		    new StreamBuffer(m_graphics, m_scheduler, MemoryUsage::Download, 512ull * 1024 * 1024);
+	}
+	const uint64_t width  = image.info.extent.width;
+	const uint64_t height = image.info.extent.height;
+	const uint64_t size   = width * height * image.info.bytes_per_block;
+	if (size == 0 || size > 256ull * 1024 * 1024) {
+		return;
+	}
+	auto [mapped, offset] = dump->Map(size, 16);
+	if (mapped == nullptr) {
+		std::fprintf(stderr, "DUMP no room %s\n", path.c_str());
+		return;
+	}
+	dump->Commit();
+	vk::BufferImageCopy copy {};
+	copy.bufferOffset                = offset;
+	copy.imageSubresource.aspectMask = vk::ImageAspectFlagBits::eColor;
+	copy.imageSubresource.layerCount = 1;
+	copy.imageExtent = vk::Extent3D {image.info.extent.width, image.info.extent.height, 1};
+	image.Download({&copy, 1}, dump->Handle(), offset, size);
+	if (image.binding.is_target && image.binding.attachment_layout != vk::ImageLayout::eUndefined) {
+		image.Transit(image.binding.attachment_layout, image.binding.attachment_access, {},
+		              m_scheduler.Current().Handle());
+	}
+	vk::BufferMemoryBarrier barrier {};
+	barrier.srcAccessMask       = vk::AccessFlagBits::eTransferWrite;
+	barrier.dstAccessMask       = vk::AccessFlagBits::eHostRead;
+	barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	barrier.buffer              = dump->Handle();
+	barrier.offset              = offset;
+	barrier.size                = size;
+	m_scheduler.Current().Handle().pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+	                                               vk::PipelineStageFlagBits::eHost, {}, 0, nullptr,
+	                                               1, &barrier, 0, nullptr);
+	const auto name = path + fmt::format("_{}x{}_vk{}.raw", width, height,
+	                                     static_cast<int>(image.info.pixel_format));
+	m_scheduler.DeferPriorityOperation([mapped, offset, size, name] {
+		dump->Invalidate(offset, size);
+		if (FILE* file = std::fopen(name.c_str(), "wb"); file != nullptr) {
+			std::fwrite(mapped, 1, size, file);
+			std::fclose(file);
+		}
+	});
+}
+
 bool TextureCache::DownloadImageMemory(ImageId id) {
 	auto& image = m_slot_images[id];
 	if (image.depth_id) {
@@ -1853,6 +1966,14 @@ void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size) {
 		auto& image = m_slot_images[id];
 		if (image.depth_id || !image.Overlaps(address, size)) {
 			continue;
+		}
+		if (PerfTmp::TraceFrame()) { // PERFTMP
+			std::fprintf(
+			    stderr,
+			    "TRACE tc gpu-buffer-write %010llx+%llx invalidates image %010llx %ux%u vk=%d\n",
+			    (unsigned long long)address, (unsigned long long)size,
+			    (unsigned long long)image.info.data.address, image.info.extent.width,
+			    image.info.extent.height, static_cast<int>(image.info.pixel_format));
 		}
 		if (image.IsGpuModified()) {
 			image.ClearGpuModified();

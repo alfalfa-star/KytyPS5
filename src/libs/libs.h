@@ -7,7 +7,8 @@
 #include "common/threads.h"
 #include "loader/timer.h" // IWYU pragma: keep
 
-#include <cstdlib> // PERFTMP
+#include <cstdlib>
+#include <cstring> // PERFTMP
 
 // NOLINTNEXTLINE(cppcoreguidelines-macro-usage)
 #define PRINT_NAME_ENABLED g_print_name
@@ -50,7 +51,7 @@
 
 // NOLINTNEXTLINE(cppcoreguidelines-macro-usage)
 #define PRINT_NAME()                                                                               \
-	if (PRINT_NAME_ENABLED || Libs::PrintAllNamesTmp()) {                                          \
+	if (PRINT_NAME_ENABLED || Libs::PrintAllNamesTmp() || Libs::PrintLibTmp(g_library)) {          \
 		if (Log::GetDirection() != Log::Direction::Silent) {                                       \
 			const auto print_name_time = Loader::Timer::GetTime().ToString("HH24:MI:SS.FFF");      \
 			LOGF_COLOR(Log::Color::Cyan, "[%d][%s] %s::%s::%s()\n",                                \
@@ -64,6 +65,20 @@ namespace Libs {
 inline bool PrintAllNamesTmp() {
 	static const bool enabled = std::getenv("KYTY_PRINT_NAMES") != nullptr;
 	return enabled;
+}
+// PERFTMP: KYTY_PRINT_LIBS=libA,libB logs every HLE call into those libraries.
+inline bool PrintLibTmp(const char* library) {
+	static const char* list = std::getenv("KYTY_PRINT_LIBS");
+	if (list == nullptr || library == nullptr) {
+		return false;
+	}
+	const auto length = std::strlen(library);
+	for (const char* p = list; (p = std::strstr(p, library)) != nullptr; p += length) {
+		if ((p == list || p[-1] == ',') && (p[length] == ',' || p[length] == 0)) {
+			return true;
+		}
+	}
+	return false;
 }
 } // namespace Libs
 

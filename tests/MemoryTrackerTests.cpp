@@ -540,6 +540,66 @@ void TestGpuDownloadProtectionMirrors() {
   Release(memory);
 }
 
+void TestAllowReadIfUnchanged() {
+  TrackerHarness harness;
+  auto &tracker = harness.tracker;
+  auto &page_manager = harness.page_manager;
+  const auto page_size = page_manager.GetPageSize();
+  auto *memory = Allocate(page_manager, 2);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  const auto second = address + page_size;
+
+  tracker.ForEachUploadRange(
+      address, page_size * 2, false, [](uint64_t, uint64_t) noexcept {},
+      []() noexcept {});
+  tracker.MarkRegionAsGpuModified(address, page_size);
+  const auto generation = tracker.GpuGeneration(address);
+  Check(tracker.AllowReadIfUnchanged(address, generation) &&
+            tracker.IsRegionGpuModified(address, page_size) &&
+            Protection(memory) == PAGE_READONLY,
+        "released page is not readable, write protected and GPU-modified");
+  Check(!tracker.AllowReadIfUnchanged(address, generation),
+        "releasing an already readable page reported success");
+
+  // A later GPU write watches reads again and invalidates the older generation.
+  tracker.MarkRegionAsGpuModified(address + 16, 16);
+  Check(Protection(memory) == PAGE_NOACCESS &&
+            !tracker.AllowReadIfUnchanged(address, generation),
+        "GPU write after release did not restore the read watch");
+
+  // Protection updates of another page must re-watch a released page, in both directions.
+  Check(tracker.AllowReadIfUnchanged(address, tracker.GpuGeneration(address)),
+        "release with the current generation failed");
+  tracker.MarkRegionAsGpuModified(second, page_size);
+  Check(Protection(memory) == PAGE_NOACCESS &&
+            Protection(memory + page_size) == PAGE_NOACCESS,
+        "marking a neighbour did not re-watch the released page");
+  Check(tracker.AllowReadIfUnchanged(address, tracker.GpuGeneration(address)),
+        "second release failed");
+  tracker.UnmarkRegionAsGpuModified(second, page_size);
+  Check(Protection(memory) == PAGE_NOACCESS &&
+            Protection(memory + page_size) == PAGE_READONLY,
+        "unmarking a neighbour released the wrong way");
+
+  tracker.UnmarkRegionAsGpuModified(address, page_size);
+  Check(!tracker.IsRegionGpuModified(address, page_size * 2) &&
+            Protection(memory) == PAGE_READONLY,
+        "final unmark did not restore write-only tracking");
+
+  // Write windows skip GPU-owned pages.
+  tracker.MarkRegionAsGpuModified(second, page_size);
+  tracker.MarkCpuModifiedUnlessGpu(address, page_size * 2);
+  Check(tracker.IsRegionCpuModified(address, page_size) && IsWritable(memory) &&
+            tracker.IsRegionGpuModified(second, page_size) &&
+            Protection(memory + page_size) == PAGE_NOACCESS,
+        "write window released a GPU-owned page or kept a clean one watched");
+
+  tracker.UnmarkRegionAsGpuModified(second, page_size);
+  tracker.MarkRegionAsCpuModified(address, page_size * 2);
+  tracker.UntrackMemory(address, page_size * 2);
+  Release(memory);
+}
+
 void TestCrossRegionUpload() {
   constexpr uintptr_t base = 0x0000000200010000ull;
   constexpr uint64_t region_size = 4ull * 1024ull * 1024ull;
@@ -934,6 +994,7 @@ int main(int argc, char **argv) {
   TestGpuDirtyBits();
   TestExactDirtyIntervalsSharingTrackerPage();
   TestGpuDownloadProtectionMirrors();
+  TestAllowReadIfUnchanged();
   TestCrossRegionUpload();
   TestUploadDoesNotSerializeDisjointRegion();
   TestDownloadDoesNotSerializeDisjointRegion();

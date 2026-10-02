@@ -767,8 +767,10 @@ static void DumpFrameTmp(GraphicContext& graphics, CommandScheduler& scheduler,
 	static const char* dir = std::getenv("KYTY_FRAME_DUMP_DIR");
 	static const int   every =
 	    std::getenv("KYTY_FRAME_DUMP_EVERY") ? std::atoi(std::getenv("KYTY_FRAME_DUMP_EVERY")) : 60;
+	static const int from =
+	    std::getenv("KYTY_FRAME_DUMP_FROM") ? std::atoi(std::getenv("KYTY_FRAME_DUMP_FROM")) : 0;
 	static int frame = 0;
-	if (dir == nullptr || (++frame % every) != 0) return;
+	if (dir == nullptr || (++frame % every) != 0 || frame < from) return;
 	const auto           w = image.extent.width, h = image.extent.height;
 	vk::BufferCreateInfo create {};
 	create.size  = uint64_t(w) * h * 4;
@@ -826,26 +828,40 @@ static void DumpFrameTmp(GraphicContext& graphics, CommandScheduler& scheduler,
 void Presenter::Present(Frame& frame, bool reuse) {
 	PERFTMP_SCOPE(__PRETTY_FUNCTION__); // PERFTMP
 	KYTY_PROFILER_FUNCTION();
-	DumpFrameTmp(m_impl->window.graphic_ctx, m_impl->present_scheduler, frame.image); // PERFTMP
+	{
+		PERFTMP_SCOPE("present: DumpFrameTmp");                                           // PERFTMP
+		DumpFrameTmp(m_impl->window.graphic_ctx, m_impl->present_scheduler, frame.image); // PERFTMP
+	}
 	m_impl->frames.ValidateForPresent(&frame, reuse);
 
 	const auto overlay_visual = GetSystemOverlayVisualState();
 	auto&      swapchain      = m_impl->swapchain;
 	for (uint32_t attempt = 0; attempt < 2; attempt++) {
-		auto status = swapchain.AcquireNextImage();
+		auto status = [&] { // PERFTMP
+			PERFTMP_SCOPE("present: AcquireNextImage");
+			return swapchain.AcquireNextImage();
+		}();
 		if (status != Swapchain::Status::Success) {
 			m_impl->RecoverSwapchain(status);
 			continue;
 		}
 		{
-			Common::LockGuard render_lock(m_impl->renderer.GetMutex());
-			auto&             command = m_impl->present_scheduler.BeginCommand();
-			const bool        draw_system_overlay =
+			PERFTMP_SCOPE("present: record+submit (render lock)"); // PERFTMP
+			m_impl->renderer.LockForPresent();
+			struct Unlock {
+				Common::Mutex& mutex;
+				~Unlock() { mutex.Unlock(); }
+			} render_lock {m_impl->renderer.GetMutex()};
+			auto&      command = m_impl->present_scheduler.BeginCommand();
+			const bool draw_system_overlay =
 			    overlay_visual.active && swapchain.PrepareSystemOverlay();
 			swapchain.RecordPresentCommands(command, frame.image, draw_system_overlay);
 			frame.present_tick = swapchain.Submit(m_impl->present_scheduler);
 		}
-		status = swapchain.Present();
+		status = [&] { // PERFTMP
+			PERFTMP_SCOPE("present: vkQueuePresent");
+			return swapchain.Present();
+		}();
 		if (status != Swapchain::Status::Success) {
 			m_impl->RecoverSwapchain(status);
 			continue;

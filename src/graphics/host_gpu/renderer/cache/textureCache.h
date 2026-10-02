@@ -60,6 +60,8 @@ public:
 		return image;
 	}
 	void MarkGpuWritten(ImageId id);
+	// PERFTMP: copies mip 0 / layer 0 of an image into `path` once the GPU has run this far.
+	void DebugDumpImage(ImageId id, const std::string& path);
 
 	[[nodiscard]] bool ClearImageFromBuffer(CommandBuffer& command, uint64_t address, uint64_t size,
 	                                        uint32_t packed_clear);

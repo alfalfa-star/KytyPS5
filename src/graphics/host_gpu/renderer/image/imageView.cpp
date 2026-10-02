@@ -4,6 +4,8 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/image/image.h"
 
+#include <vulkan/vulkan_format_traits.hpp>
+
 namespace Libs::Graphics {
 
 namespace {
@@ -328,8 +330,15 @@ vk::ImageView Image::FindView(const ImageViewInfo& view_info) {
 		}
 	}
 
-	const bool format_compatible = normalized.format != vk::Format::eUndefined &&
-	                               ImageViewOps::FormatsCompatible(image.format, normalized.format);
+	// An uncompressed view of a block image needs the block-texel flag, which the image
+	// may have been created without (see the Image constructor).
+	const bool block_texel_view = *vk::compressionScheme(image.format) != '\0' &&
+	                              *vk::compressionScheme(normalized.format) == '\0';
+	const bool format_compatible =
+	    normalized.format != vk::Format::eUndefined &&
+	    ImageViewOps::FormatsCompatible(image.format, normalized.format) &&
+	    (!block_texel_view ||
+	     static_cast<bool>(image.flags & vk::ImageCreateFlagBits::eBlockTexelViewCompatible));
 	const bool slice_view =
 	    image.image_type == vk::ImageType::e3D && (normalized.type == vk::ImageViewType::e2D ||
 	                                               normalized.type == vk::ImageViewType::e2DArray);

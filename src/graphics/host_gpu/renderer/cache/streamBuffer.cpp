@@ -237,7 +237,7 @@ bool StreamBuffer::NormalizeReservation(bool coherent, uint64_t atom, uint64_t& 
 }
 
 std::pair<uint8_t*, uint64_t> StreamBuffer::Map(uint64_t size, uint64_t alignment,
-                                                bool allow_wait) {
+                                                WaitPolicy policy) {
 	if (Mapped().empty()) {
 		return {nullptr, 0};
 	}
@@ -266,7 +266,7 @@ std::pair<uint8_t*, uint64_t> StreamBuffer::Map(uint64_t size, uint64_t alignmen
 	    wrap ? std::optional<size_t> {m_current_watch_cursor} : m_invalidation_mark;
 	auto& pending_watches = wrap ? m_current_watches : m_previous_watches;
 	if (!WaitPendingOperations(pending_watches, invalidation_mark, aligned_offset + mapped_size,
-	                           allow_wait, wait_cursor, wait_bound)) {
+	                           policy, wait_cursor, wait_bound)) {
 		return {nullptr, 0};
 	}
 
@@ -312,14 +312,16 @@ uint64_t StreamBuffer::Copy(const void* source, uint64_t size, uint64_t alignmen
 
 bool StreamBuffer::WaitPendingOperations(const std::vector<Watch>& watches,
                                          std::optional<size_t>     invalidation_mark,
-                                         uint64_t requested_upper_bound, bool allow_wait,
+                                         uint64_t requested_upper_bound, WaitPolicy policy,
                                          size_t& wait_cursor, uint64_t& wait_bound) {
 	if (!invalidation_mark.has_value()) {
 		return true;
 	}
 	while (requested_upper_bound > wait_bound && wait_cursor < *invalidation_mark) {
 		const auto& watch = watches[wait_cursor];
-		if (!Scheduler().IsFree(watch.tick) && !allow_wait) {
+		if (!Scheduler().IsFree(watch.tick) &&
+		    (policy == WaitPolicy::Never ||
+		     (policy == WaitPolicy::SubmittedOnly && watch.tick >= Scheduler().CurrentTick()))) {
 			return false;
 		}
 		PERFTMP_SCOPE("wait: stream buffer wrap"); // PERFTMP

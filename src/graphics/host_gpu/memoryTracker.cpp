@@ -106,6 +106,32 @@ void MemoryTracker::UnmarkRegionAsGpuModified(uint64_t vaddr, uint64_t size) {
 	});
 }
 
+uint32_t MemoryTracker::GpuGeneration(uint64_t page) {
+	uint32_t generation = 0;
+	Iterate<false>(page, TRACKER_PAGE_SIZE, [&](RegionManager* manager, uint64_t offset, uint64_t) {
+		std::scoped_lock lock(manager->lock);
+		generation = manager->GpuGeneration(manager->GetCpuAddr() + offset);
+	});
+	return generation;
+}
+
+void MemoryTracker::MarkCpuModifiedUnlessGpu(uint64_t vaddr, uint64_t size) {
+	CheckNotInUploadCallback();
+	Iterate<false>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+		std::scoped_lock lock(manager->lock);
+		manager->MarkCpuModifiedUnlessGpu(manager->GetCpuAddr() + offset, bytes);
+	});
+}
+
+bool MemoryTracker::AllowReadIfUnchanged(uint64_t page, uint32_t generation) {
+	bool allowed = false;
+	Iterate<false>(page, TRACKER_PAGE_SIZE, [&](RegionManager* manager, uint64_t offset, uint64_t) {
+		std::scoped_lock lock(manager->lock);
+		allowed = manager->AllowReadIfUnchanged(manager->GetCpuAddr() + offset, generation);
+	});
+	return allowed;
+}
+
 void MemoryTracker::UntrackMemory(uint64_t vaddr, uint64_t size) {
 	CheckNotInUploadCallback();
 	std::vector<RegionManager*> managers;

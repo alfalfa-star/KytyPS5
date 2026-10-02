@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib> // PERFTMP
+#include <iterator>
 #include <optional>
 
 namespace Libs::Graphics {
@@ -261,12 +262,24 @@ void CommandScheduler::DeferOperation(Common::UniqueFunction<void>&& operation) 
 	operation();
 }
 
-void CommandScheduler::DeferPriorityOperation(Common::UniqueFunction<void>&& operation) {
+void CommandScheduler::DeferPriorityOperation(Common::UniqueFunction<void>&& operation,
+                                              bool                           ahead_of_tick) {
 	CheckActive();
 	EXIT_IF(!operation);
 	std::unique_lock lock(m_operation_mutex);
 	if (m_operation_state == OperationState::Open) {
-		m_priority_operations.push({std::move(operation), CurrentTick()});
+		const auto tick     = CurrentTick();
+		auto       position = m_priority_operations.end();
+		if (ahead_of_tick) {
+			// Operations of the current tick are the queue's tail and none has started. Go
+			// before the tick's other operations but stay behind earlier ahead ones, so that
+			// downloads keep their order.
+			while (position != m_priority_operations.begin() && std::prev(position)->tick == tick &&
+			       !std::prev(position)->ahead) {
+				--position;
+			}
+		}
+		m_priority_operations.insert(position, {std::move(operation), tick, ahead_of_tick});
 		lock.unlock();
 		m_operation_available.notify_one();
 		return;
@@ -294,7 +307,7 @@ void CommandScheduler::PriorityOperationsThread(std::stop_token stop) {
 				return;
 			}
 			operation = std::move(m_priority_operations.front());
-			m_priority_operations.pop();
+			m_priority_operations.pop_front();
 			m_priority_active      = true;
 			m_priority_active_tick = operation.tick;
 		}

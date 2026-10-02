@@ -33,6 +33,8 @@
 #include <algorithm>
 #include <atomic>
 #include <bit>
+#include <cstdlib>
+#include <cstring>
 #include <fmt/format.h>
 #include <limits>
 #include <set> // PERFTMP
@@ -1218,6 +1220,19 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 				    static_cast<unsigned long long>(info.data.address),
 				    static_cast<unsigned>(info.guest_format), info.extent.width, info.extent.height,
 				    info.extent.depth, program.info.images[i].bindless ? " bindless" : "");
+			}
+			if (PerfTmp::DumpShader(program.shader_hash)) {
+				const int   seq = PerfTmp::NextDumpSeq();
+				const char* dir = std::getenv("KYTY_DUMP_DIR");
+				for (uint32_t i = 0; seq >= 0 && i < prepared->images.size(); i++) {
+					const auto& binding = prepared->images[i];
+					const auto  path    = fmt::format(
+					    "{}/f{}_{:04}_{:016x}_img{}_{}_{:010x}", dir != nullptr ? dir : ".",
+					    PerfTmp::FlipCounter().load(), seq, program.shader_hash, i,
+					    binding.desc.type == TextureCache::BindingType::Storage ? "RW" : "R",
+					    binding.desc.info.data.address);
+					m_context.GetTextureCache().DebugDumpImage(binding.image_id, path);
+				}
 			}
 		}
 	}

@@ -9,14 +9,17 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
 #include <chrono> // PERFTMP
 #include <cinttypes>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fmt/format.h>
 #include <functional>
-#include <mutex> // PERFTMP
+#include <memory>
+#include <mutex>
 #include <numeric>
 #include <unordered_map>
 #include <unordered_set>
@@ -34,11 +37,22 @@ constexpr size_t MaxBufferArenas          = 32u;
 constexpr uint64_t MaxBufferArenaGap  = 4ull << 20u;
 constexpr uint64_t MaxBufferArenaSpan = 256ull << 20u;
 
+// BuildBufferArenas output for one table, reused while the table itself is reused.
+struct ArenaMemo {
+	const ResourcePlan*            program  = nullptr;
+	uint32_t                       resource = UINT32_MAX;
+	ResourceSpecialization::Buffer exemplar;
+	std::vector<uint32_t>          records;
+	std::vector<DescriptorValue>   arenas;
+};
+
 struct IndirectTable {
 	uint32_t                     resource = 0;
 	std::vector<uint32_t>        keys;
 	std::vector<uint32_t>        candidates;
 	std::vector<DescriptorValue> descriptors;
+	// Set on tables served from the descriptor-table cache.
+	std::shared_ptr<ArenaMemo> arena_memo;
 };
 
 struct MaterializedSnapshot {
@@ -464,6 +478,170 @@ bool MaterializeIndirectTable(const DescriptorSource::IndirectTable& indirect,
 	return true;
 }
 
+std::atomic<uint64_t> g_table_epoch {1};
+// Every span cached tables of the current epoch were read from, and the latest range writes,
+// so that a write from any thread invalidates exactly the tables it can affect.
+struct RangeWrite {
+	uint64_t serial = 0;
+	uint64_t begin  = 0;
+	uint64_t end    = 0;
+};
+std::mutex                                 g_cached_spans_mutex;
+std::vector<std::pair<uint64_t, uint64_t>> g_cached_spans;
+std::array<RangeWrite, 256>                g_recent_writes;
+uint64_t                                   g_write_serial = 0;
+
+uint64_t CurrentWriteSerial() {
+	std::scoped_lock lock(g_cached_spans_mutex);
+	return g_write_serial;
+}
+
+// Publishes the spans of a table read since `serial` in `epoch`; false when memory it read may
+// have changed meanwhile.
+bool PublishCachedSpans(const std::vector<std::pair<uint64_t, uint64_t>>& spans, uint64_t serial,
+                        uint64_t epoch) {
+	std::scoped_lock lock(g_cached_spans_mutex);
+	if (g_table_epoch.load(std::memory_order_acquire) != epoch ||
+	    g_write_serial - serial > g_recent_writes.size()) {
+		return false;
+	}
+	for (auto next = serial + 1; next <= g_write_serial; next++) {
+		const auto& write = g_recent_writes[next % g_recent_writes.size()];
+		if (std::ranges::any_of(spans, [&](const auto& span) {
+			    return write.begin < span.second && span.first < write.end;
+		    })) {
+			return false;
+		}
+	}
+	for (const auto& span: spans) {
+		if (std::ranges::find(g_cached_spans, span) == g_cached_spans.end()) {
+			g_cached_spans.push_back(span);
+		}
+	}
+	return true;
+}
+
+struct TableCacheKey {
+	const DescriptorSource::IndirectTable* indirect = nullptr;
+	DescriptorValue                        material;
+	DescriptorValue                        heap;
+	uint32_t                               key_limit = 0;
+	bool                                   r128      = false;
+
+	bool operator==(const TableCacheKey&) const = default;
+};
+
+struct TableCacheKeyHash {
+	size_t operator()(const TableCacheKey& key) const {
+		const DescriptorValueHash hash;
+		return std::hash<const void*> {}(key.indirect) ^ (hash(key.material) * 31u) ^
+		       (hash(key.heap) * 131u) ^ (static_cast<size_t>(key.key_limit) << 1u) ^
+		       static_cast<size_t>(key.r128);
+	}
+};
+
+struct TableCacheEntry {
+	uint64_t                                   epoch = 0;
+	std::vector<std::pair<uint64_t, uint64_t>> spans; // guest memory the table was read from
+	IndirectTable                              table;
+};
+
+// Only the GPU thread materializes with a gpu_busy query; keep the cache per thread.
+thread_local std::unordered_map<TableCacheKey, TableCacheEntry, TableCacheKeyHash> g_table_cache;
+
+constexpr uint64_t CachePageSize      = 0x1000;
+constexpr size_t   MaxTableCacheSize  = 4096;
+constexpr size_t   MaxTableCacheSpans = 64;
+
+// Forwards specialization reads and remembers the pages they touched.
+struct RecordingReader {
+	const SrtRuntime*     runtime = nullptr;
+	std::vector<uint64_t> pages;
+
+	static bool Read(void* userdata, uint64_t address, uint32_t* value) {
+		auto*      self = static_cast<RecordingReader*>(userdata);
+		const auto page = address & ~(CachePageSize - 1u);
+		if (self->pages.empty() || self->pages.back() != page) {
+			self->pages.push_back(page);
+		}
+		return ReadSpecializationWord(*self->runtime, address, *value);
+	}
+};
+
+bool SpansIdle(const SrtRuntime& runtime, const std::vector<std::pair<uint64_t, uint64_t>>& spans) {
+	return std::ranges::none_of(spans, [&](const auto& span) {
+		return runtime.gpu_busy(runtime.userdata, span.first, span.second - span.first);
+	});
+}
+
+// MaterializeIndirectTable, reusing the last result for the same table and descriptors while
+// the memory it was read from cannot have changed.
+bool MaterializeIndirectTableCached(const DescriptorSource::IndirectTable& indirect,
+                                    const DescriptorValue&                 material_value,
+                                    const DescriptorValue& heap_value, bool r128,
+                                    uint32_t key_limit, const SrtRuntime& runtime,
+                                    IndirectTable& result) {
+	static const bool perftmp_no_cache = std::getenv("KYTY_NO_TABLE_CACHE") != nullptr; // PERFTMP
+	if (runtime.gpu_busy == nullptr || runtime.watch_writes == nullptr || perftmp_no_cache) {
+		return MaterializeIndirectTable(indirect, material_value, heap_value, r128, key_limit,
+		                                runtime, result);
+	}
+	const TableCacheKey key {.indirect  = &indirect,
+	                         .material  = material_value,
+	                         .heap      = heap_value,
+	                         .key_limit = key_limit,
+	                         .r128      = r128};
+	const auto          epoch = g_table_epoch.load(std::memory_order_acquire);
+	if (const auto found = g_table_cache.find(key); found != g_table_cache.end()) {
+		if (found->second.epoch == epoch && SpansIdle(runtime, found->second.spans)) {
+			PERFTMP_SCOPE("mat: table cache hit"); // PERFTMP
+			result = found->second.table;
+			return true;
+		}
+		g_table_cache.erase(found);
+	}
+
+	const auto      serial = CurrentWriteSerial();
+	RecordingReader recorder {.runtime = &runtime};
+	SrtRuntime      recording            = runtime;
+	recording.read_memory                = RecordingReader::Read;
+	recording.read_specialization_memory = RecordingReader::Read;
+	recording.userdata                   = &recorder;
+	recording.gpu_owned                  = nullptr;
+	recording.gpu_busy                   = nullptr;
+	if (!MaterializeIndirectTable(indirect, material_value, heap_value, r128, key_limit, recording,
+	                              result)) {
+		return false;
+	}
+
+	result.arena_memo = std::make_shared<ArenaMemo>();
+	auto& pages       = recorder.pages;
+	std::ranges::sort(pages);
+	pages.erase(std::unique(pages.begin(), pages.end()), pages.end());
+	TableCacheEntry entry {.epoch = epoch, .table = result};
+	for (const auto page: pages) {
+		if (!entry.spans.empty() && entry.spans.back().second == page) {
+			entry.spans.back().second = page + CachePageSize;
+		} else {
+			entry.spans.emplace_back(page, page + CachePageSize);
+		}
+	}
+	// Memory the GPU owns was read through a flush and may change without an epoch bump.
+	const auto watched = [&] {
+		return std::ranges::all_of(entry.spans, [&](const auto& span) {
+			return runtime.watch_writes(runtime.userdata, span.first, span.second - span.first);
+		});
+	};
+	if (entry.spans.size() <= MaxTableCacheSpans && SpansIdle(runtime, entry.spans) && watched() &&
+	    PublishCachedSpans(entry.spans, serial, epoch)) {
+		if (g_table_cache.size() >= MaxTableCacheSize) {
+			g_table_cache.clear();
+		}
+		g_table_cache.insert_or_assign(key, std::move(entry));
+	}
+	return true;
+}
+
 // Reads the table descriptors and the loop bound (when the key is a loop counter) behind an
 // indirect source with memory as it is when the shader is bound.
 // A select table's candidates are ordinary descriptor sources; key i names candidate i.
@@ -501,6 +679,7 @@ bool MaterializeSelectTable(const ResourcePlan&                    program,
 
 bool MaterializeTableSource(const ResourcePlan& program, const DescriptorSource& source, bool r128,
                             const SrtRuntime& runtime, IndirectTable& table) {
+	PERFTMP_SCOPE("mat: MaterializeTableSource"); // PERFTMP
 	const auto& indirect = *source.indirect_table;
 	if (!indirect.candidate_sources.empty()) {
 		return MaterializeSelectTable(program, indirect, r128, runtime, table);
@@ -521,8 +700,9 @@ bool MaterializeTableSource(const ResourcePlan& program, const DescriptorSource&
 		}
 		key_limit = bound[0];
 	}
-	if (!MaterializeIndirectTable(indirect, tables[0], tables[1], r128, key_limit, runtime,
-	                              table)) {
+	PERFTMP_SCOPE("mat: MaterializeIndirectTable"); // PERFTMP
+	if (!MaterializeIndirectTableCached(indirect, tables[0], tables[1], r128, key_limit, runtime,
+	                                    table)) {
 		return SpecializationFail(fmt::format(
 		    "indirect table at heap offset 0x{:x} ({} dwords, stride {}, {} keys, limit {}) could "
 		    "not be read",
@@ -708,6 +888,32 @@ template <typename SpecializeBuffer>
 static bool BuildBufferArenas(const ResourcePlan& program, const IndirectTable& table,
                               const SpecializeBuffer& specialize_buffer, ResourceSnapshot& snapshot,
                               ResourceSpecialization& specialization) {
+	PERFTMP_SCOPE("mat: BuildBufferArenas"); // PERFTMP
+	auto&      root   = specialization.buffers[table.resource];
+	const auto replay = [&](const ArenaMemo& memo) {
+		root                       = {.packed_stride              = memo.exemplar.packed_stride,
+		                              .descriptor_format          = memo.exemplar.descriptor_format,
+		                              .descriptor_swizzle         = memo.exemplar.descriptor_swizzle,
+		                              .indirect_root              = root.indirect_root,
+		                              .indirect_mapping_offset    = root.indirect_mapping_offset,
+		                              .indirect_search_iterations = root.indirect_search_iterations,
+		                              .indirect_arena             = true};
+		root.indirect_arena_offset = static_cast<uint32_t>(snapshot.flattened_srt.size());
+		snapshot.flattened_srt.insert(snapshot.flattened_srt.end(), memo.records.begin(),
+		                              memo.records.end());
+		snapshot.buffers[table.resource] = memo.arenas.front();
+		for (size_t index = 1; index < memo.arenas.size(); index++) {
+			snapshot.buffers.push_back(memo.arenas[index]);
+			auto buffer          = memo.exemplar;
+			buffer.indirect_root = table.resource;
+			specialization.buffers.push_back(buffer);
+		}
+	};
+	if (table.arena_memo != nullptr && table.arena_memo->program == &program &&
+	    table.arena_memo->resource == table.resource) {
+		replay(*table.arena_memo);
+		return true;
+	}
 	const auto pc = program.info.buffers[table.resource].first_use_pc;
 	struct Candidate {
 		ShaderBufferResource           descriptor;
@@ -779,21 +985,11 @@ static bool BuildBufferArenas(const ResourcePlan& program, const IndirectTable& 
 		                arenas.size(), MaxBufferArenas));
 	}
 
-	auto& root                 = specialization.buffers[table.resource];
-	root                       = {.packed_stride              = exemplar->buffer.packed_stride,
-	                              .descriptor_format          = exemplar->buffer.descriptor_format,
-	                              .descriptor_swizzle         = exemplar->buffer.descriptor_swizzle,
-	                              .indirect_root              = root.indirect_root,
-	                              .indirect_mapping_offset    = root.indirect_mapping_offset,
-	                              .indirect_search_iterations = root.indirect_search_iterations,
-	                              .indirect_arena             = true};
-	root.indirect_arena_offset = static_cast<uint32_t>(snapshot.flattened_srt.size());
-	snapshot.flattened_srt.resize(snapshot.flattened_srt.size() +
-	                              candidates.size() * BufferArenaRecordDwords);
+	ArenaMemo memo {.program = &program, .resource = table.resource, .exemplar = exemplar->buffer};
+	memo.records.resize(candidates.size() * BufferArenaRecordDwords);
 	for (size_t index = 0; index < candidates.size(); index++) {
 		const auto& candidate = candidates[index];
-		auto*       record =
-		    &snapshot.flattened_srt[root.indirect_arena_offset + index * BufferArenaRecordDwords];
+		auto*       record    = &memo.records[index * BufferArenaRecordDwords];
 		if (!candidate.typed) {
 			continue; // A null record: arena 0, empty range.
 		}
@@ -804,22 +1000,22 @@ static bool BuildBufferArenas(const ResourcePlan& program, const IndirectTable& 
 		record[1] = static_cast<uint32_t>(base - arena->begin);
 		record[2] = static_cast<uint32_t>(candidate.descriptor.GetSize());
 	}
+	// The arena count is part of the shader variant; round it up (the extra arenas repeat the
+	// first and no record selects them) so tables of similar spread share one variant.
+	const auto used_arenas = arenas.size();
+	arenas.resize(std::bit_ceil(std::max<size_t>(used_arenas, 1u)), arenas.front());
 	const auto stride = std::max<uint32_t>(exemplar->descriptor.Stride(), 1u);
-	for (size_t index = 0; index < arenas.size(); index++) {
+	for (const auto& arena: arenas) {
 		DescriptorValue value = table.descriptors[exemplar - candidates.data()];
-		value.dwords[0]       = static_cast<uint32_t>(arenas[index].begin);
-		value.dwords[1]       = (value.dwords[1] & 0xffff0000u) |
-		                        static_cast<uint32_t>((arenas[index].begin >> 32u) & 0xffffu);
-		value.dwords[2] =
-		    static_cast<uint32_t>((arenas[index].end - arenas[index].begin + stride - 1u) / stride);
-		if (index == 0u) {
-			snapshot.buffers[table.resource] = value;
-			continue;
-		}
-		snapshot.buffers.push_back(value);
-		auto buffer          = exemplar->buffer;
-		buffer.indirect_root = table.resource;
-		specialization.buffers.push_back(buffer);
+		value.dwords[0]       = static_cast<uint32_t>(arena.begin);
+		value.dwords[1] =
+		    (value.dwords[1] & 0xffff0000u) | static_cast<uint32_t>((arena.begin >> 32u) & 0xffffu);
+		value.dwords[2] = static_cast<uint32_t>((arena.end - arena.begin + stride - 1u) / stride);
+		memo.arenas.push_back(value);
+	}
+	replay(memo);
+	if (table.arena_memo != nullptr) {
+		*table.arena_memo = std::move(memo);
 	}
 	return true;
 }
@@ -827,6 +1023,7 @@ static bool BuildBufferArenas(const ResourcePlan& program, const IndirectTable& 
 static bool BuildResourceSpecialization(const ResourcePlan& program, MaterializedSnapshot snapshot,
                                         ResourceSnapshot&       specialized_snapshot,
                                         ResourceSpecialization& specialization) {
+	PERFTMP_SCOPE("mat: BuildResourceSpecialization"); // PERFTMP
 	auto                   next_snapshot = std::move(snapshot.resources);
 	ResourceSpecialization next_specialization;
 	next_specialization.buffers.reserve(program.info.buffers.size());
@@ -1630,6 +1827,25 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 	}
 	plan.compiled_srt = std::make_shared<const CompiledSrtProgram>(CompileSrtProgram(plan));
 	return plan;
+}
+
+void InvalidateDescriptorTableCache() {
+	std::scoped_lock lock(g_cached_spans_mutex);
+	g_cached_spans.clear();
+	g_table_epoch.fetch_add(1, std::memory_order_acq_rel);
+}
+
+void InvalidateDescriptorTableCache(uint64_t address, uint64_t size) {
+	std::scoped_lock lock(g_cached_spans_mutex);
+	const auto       end = address + size;
+	g_write_serial++;
+	g_recent_writes[g_write_serial % g_recent_writes.size()] = {g_write_serial, address, end};
+	if (std::ranges::any_of(g_cached_spans, [&](const auto& span) {
+		    return address < span.second && span.first < end;
+	    })) {
+		g_cached_spans.clear();
+		g_table_epoch.fetch_add(1, std::memory_order_acq_rel);
+	}
 }
 
 bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,

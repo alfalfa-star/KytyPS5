@@ -17,9 +17,13 @@
 #include <algorithm>
 #include <chrono>
 #include <cinttypes>
+#include <cstdio> // PERFTMP
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <mutex>         // PERFTMP
+#include <set>           // PERFTMP
+#include <unordered_map> // PERFTMP
 #include <utility>
 #include <vector>
 
@@ -122,7 +126,7 @@ void BufferCache::DeleteBuffer(BufferId id) {
 }
 
 bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size,
-                                       bool keep_dirty) {
+                                       bool keep_dirty, const PageRelease* release) {
 	std::vector<vk::BufferCopy> copies;
 	uint64_t                    total_size     = 0;
 	const auto                  buffer_address = buffer.CpuAddress();
@@ -143,8 +147,14 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 		return false;
 	}
 
-	const auto [mapped, offset] = m_download_buffer.Map(total_size, 64);
+	const auto [mapped, offset] =
+	    m_download_buffer.Map(total_size, 64,
+	                          release == nullptr ? StreamBuffer::WaitPolicy::Always
+	                                             : StreamBuffer::WaitPolicy::SubmittedOnly);
 	if (mapped == nullptr) {
+		if (release != nullptr) {
+			return false; // prefetch: the range stays dirty; a fault downloads it later
+		}
 		EXIT("BufferCache: download exceeds 32 MiB staging buffer capacity\n");
 	}
 	m_download_buffer.Commit();
@@ -179,14 +189,23 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 	                       vk::PipelineStageFlagBits::eAllCommands |
 	                           vk::PipelineStageFlagBits::eHost,
 	                       {}, 0, nullptr, 1, &after, 0, nullptr);
-	m_scheduler.DeferPriorityOperation([this, mapped, offset, total_size, buffer_address,
-	                                    copies = std::move(copies)] {
-		m_download_buffer.Invalidate(offset, total_size);
-		for (const auto& copy: copies) {
-			Libs::LibKernel::Memory::WriteBacking(buffer_address + copy.srcOffset,
-			                                      mapped + (copy.dstOffset - offset), copy.size);
-		}
-	});
+	m_scheduler.DeferPriorityOperation(
+	    [this, mapped, offset, total_size, buffer_address, copies = std::move(copies),
+	     release = release != nullptr ? *release : PageRelease {}] {
+		    m_download_buffer.Invalidate(offset, total_size);
+		    for (const auto& copy: copies) {
+			    Libs::LibKernel::Memory::WriteBacking(
+			        buffer_address + copy.srcOffset, mapped + (copy.dstOffset - offset), copy.size);
+		    }
+		    // The guest may read the page as soon as this tick's fences are visible; lift the read
+		    // protection here instead of waiting for the GPU thread to finalize the prefetch.
+		    static const bool perftmp_no_release =
+		        std::getenv("KYTY_NO_EARLY_RELEASE") != nullptr; // PERFTMP
+		    if (release.page != 0 && !perftmp_no_release) {
+			    (void)m_memory_tracker.AllowReadIfUnchanged(release.page, release.generation);
+		    }
+	    },
+	    /*ahead_of_tick=*/true);
 	return true;
 }
 
@@ -254,6 +273,13 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		EXIT("unsupported buffer readback from an asynchronous GPU completion, "
 		     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
 		     vaddr, size);
+	}
+	// A read fault on memory the GPU no longer owns lost a race with its release: retry the
+	// access right away instead of queueing behind the GPU thread's current command.
+	if (!is_write && !GuestGpu::IsGpuThread() &&
+	    !m_memory_tracker.IsRegionGpuModified(vaddr, size)) {
+		PERFTMP_SCOPE("ReadMemory: fast path (not GPU-owned)"); // PERFTMP
+		return;
 	}
 	m_scheduler.Context().GetGpu().SendCommandSync([this, vaddr, size, is_write] {
 		if (is_write && !IsRegionRegistered(vaddr, size)) {
@@ -390,7 +416,16 @@ void BufferCache::PrefetchReadbackPages() {
 	    CommandScheduler::InDeferredOperation()) {
 		return;
 	}
-	PERFTMP_SCOPE("PrefetchReadbackPages");                    // PERFTMP
+	PERFTMP_SCOPE("PrefetchReadbackPages"); // PERFTMP
+	{                                       // PERFTMP: hot page set size
+		static auto last = std::chrono::steady_clock::now();
+		if (std::chrono::steady_clock::now() - last > std::chrono::seconds(5)) {
+			last = std::chrono::steady_clock::now();
+			std::fprintf(stderr, "PERFTMP readback pages=%zu pending=%zu rewritten=%zu\n",
+			             m_readback_pages.size(), m_pending_readback_pages.size(),
+			             m_rewritten_readback_pages.size());
+		}
+	}
 	if (std::getenv("KYTY_NO_READBACK_PREFETCH") != nullptr) { // PERFTMP
 		return;
 	}
@@ -412,9 +447,11 @@ void BufferCache::PrefetchReadbackPages() {
 		if (owner == nullptr || !*owner) {
 			continue;
 		}
-		auto& owner_buffer = m_slot_buffers[*owner];
+		auto&             owner_buffer = m_slot_buffers[*owner];
+		const PageRelease release {.page       = page,
+		                           .generation = m_memory_tracker.GpuGeneration(page)};
 		if (!owner_buffer.IsInBounds(page, TRACKER_PAGE_SIZE) ||
-		    !DownloadBufferMemory(owner_buffer, page, TRACKER_PAGE_SIZE, true)) {
+		    !DownloadBufferMemory(owner_buffer, page, TRACKER_PAGE_SIZE, true, &release)) {
 			continue;
 		}
 		if (found->second.pending_tick == 0) {
@@ -656,6 +693,21 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	TouchBuffer(buffer);
 	(void)SynchronizeBuffer(buffer, vaddr, size, is_written, is_texel_buffer);
 	if (is_written) {
+		{ // PERFTMP: writable bindings over the hottest CPU-written pages
+			static std::set<std::pair<uint64_t, uint64_t>> logged;
+			constexpr uint64_t hot[] = {0x5000000000ull, 0x201e980000ull, 0x2002998000ull,
+			                            0x200a098000ull};
+			for (const auto page: hot) {
+				if (page >= vaddr && page < vaddr + size && logged.insert({vaddr, size}).second &&
+				    logged.size() < 64) {
+					std::fprintf(stderr,
+					             "PERFTMP gpu-written binding page=%llx vaddr=%llx size=%llx "
+					             "texel=%d\n",
+					             (unsigned long long)page, (unsigned long long)vaddr,
+					             (unsigned long long)size, is_texel_buffer ? 1 : 0);
+				}
+			}
+		}
 		m_gpu_modified_ranges.Add(vaddr, size);
 		MarkReadbackPagesWritten(vaddr, size);
 	}
@@ -724,7 +776,10 @@ void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool
 	}
 	(void)m_texture_cache.ClearMeta(vaddr);
 	if (!IsRegionGpuModified(vaddr, size)) {
-		// Access the guest mapping so write faults invalidate cached buffers and images.
+		// Invalidate the whole range as its write faults would, one fault per page, then write
+		// through the guest mapping.
+		InvalidateMemory(vaddr, size);
+		m_texture_cache.InvalidateMemory(vaddr, size);
 		auto* destination = reinterpret_cast<uint32_t*>(vaddr);
 		std::fill(destination, destination + size / sizeof(uint32_t), value);
 		return;
@@ -751,6 +806,8 @@ void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t si
 	if (src_memory && dst_memory && !IsRegionGpuModified(dst_vaddr, size) &&
 	    !IsRegionGpuModified(src_vaddr, size) &&
 	    !m_texture_cache.FindImageFromRange(src_vaddr, size)) {
+		InvalidateMemory(dst_vaddr, size);
+		m_texture_cache.InvalidateMemory(dst_vaddr, size);
 		std::memcpy(reinterpret_cast<void*>(dst_vaddr), reinterpret_cast<const void*>(src_vaddr),
 		            size);
 		return;
@@ -785,6 +842,13 @@ bool BufferCache::IsRegionRegistered(uint64_t vaddr, uint64_t size) {
 
 bool BufferCache::IsRegionGpuModified(uint64_t vaddr, uint64_t size) {
 	return m_memory_tracker.IsRegionGpuModified(vaddr, size);
+}
+
+void BufferCache::ReleaseWriteWindow(uint64_t fault_vaddr) {
+	constexpr uint64_t WindowSize = 64 * 1024;
+	static_assert(TRACKER_REGION_SIZE % WindowSize == 0);
+	m_memory_tracker.MarkCpuModifiedUnlessGpu(Common::AlignDown(fault_vaddr, WindowSize),
+	                                          WindowSize);
 }
 
 bool BufferCache::HasGpuDirtyBytes(uint64_t vaddr, uint64_t size) {
